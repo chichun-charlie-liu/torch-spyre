@@ -32,6 +32,7 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
     ExternKernelSchedulerNode,
+    NopKernelSchedulerNode,
 )
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
@@ -242,7 +243,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         )
 
 
-def fallback_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
+def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     output: FixedLayout = n.node.get_layout()
     # Use the generic stick format
     stl = SpyreTensorLayout(output.size, output.dtype)
@@ -306,10 +307,13 @@ def propagate_spyre_tensor_layouts(
                 ):
                     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
-                output_layout = fallback_layout(n)
+                output_layout = generic_layout(n)
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, NopKernelSchedulerNode):
+            output_layout = generic_layout(n)
+            n.node.layout = output_layout
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 
