@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from pathlib import Path
 from torch_spyre._inductor.constants import (
     MATMUL_REDUCTION_OP,
     BATCH_MATMUL_OP,
@@ -141,6 +144,41 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             outputs=outputs,
             **kwargs,
         )
+
+    # TODO make it more generic for future custom ops => load template then replace vars
+    parent_dir = Path(__file__).resolve().parent
+    json_template_file = parent_dir / f"{op}_template.json"
+    if "custom" in op and json_template_file.exists():
+        with open(json_template_file, "r") as f:
+            custom_sdsc = json.load(f)
+
+        # PREP, borrowed from generate_sfp_op
+        # ignore cores related setting for now for simplicity, assuming 1 core
+        tensors = inputs + outputs
+        # data_format = get_sen_data_format(inputs[0]["dtype"])
+        # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
+        cores = int(os.getenv("SENCORES", "1"))
+        d2 = len(dimensions) >= 2
+        d3 = len(dimensions) >= 3
+        dsc0 = custom_sdsc[op]["dscs_"][0][op]
+
+        match op:
+            case "custom_softmax":
+                # 1. update tensor dims
+                dims = {
+                    "mb_": dimensions[0] if d2 else 0,
+                    "x_": dimensions[1] if d3 else 0,
+                    "out_": dimensions[-1]
+                }
+                for dim, val in dims.items():
+                    dsc0["N_"][dim] = val
+                    dsc0["dataStageParam_"]["0"]["ss_"][dim] = val
+                    dsc0["dataStageParam_"]["0"]["el_"][dim] = val
+
+                # To be continued...
+
+        return custom_sdsc
+
     return generate_sfp_op(
         pointers,
         op=op,

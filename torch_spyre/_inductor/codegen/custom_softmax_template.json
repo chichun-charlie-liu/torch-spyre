@@ -1,0 +1,901 @@
+{
+  "custom_softmax": {
+    "sdscFoldProps_": [
+      {
+        "factor_": 1,
+        "label_": "time"
+      }
+    ],
+    "sdscFolds_": {
+      "dim_prop_func": [
+        {
+          "Affine": {
+            "alpha_": 1,
+            "beta_": 0
+          }
+        }
+      ],
+      "dim_prop_attr": [
+        {
+          "factor_": 1,
+          "label_": "time"
+        }
+      ],
+      "data_": {
+        "[0]": "0"
+      }
+    },
+    "coreFoldProp_": {
+      "factor_": 1,
+      "label_": "core"
+    },
+    "coreletFoldProp_": {
+      "factor_": 1,
+      "label_": "corelet"
+    },
+    "numCoresUsed_": 1,
+    "coreIdToDsc_": {
+      "0": 0
+    },
+    "numWkSlicesPerDim_": {
+      "mb": 1,
+      "x": 0,
+      "out": 1
+    },
+    "coreIdToWkSlice_": {
+      "0": {
+        "mb": 0,
+        "x": 0,
+        "out": 0
+      }
+    },
+    "coreIdToDscSchedule": {
+      "0": [
+        [
+          -1,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "dscs_": [
+      {
+        "custom_softmax": {
+          "numCoresUsed_": 1,
+          "numCoreletsUsed_": 1,
+          "coreIdsUsed_": [
+            0
+          ],
+          "N_": {
+            "name_": "n",
+            "mb_": 512,
+            "x_": 0,
+            "out_": 1024
+          },
+          "dataStageParam_": {
+            "0": {
+              "ss_": {
+                "name_": "core",
+                "mb_": 512,
+                "x_": 0,
+                "out_": 1024
+              },
+              "el_": {
+                "name_": "core",
+                "mb_": 512,
+                "x_": 0,
+                "out_": 1024
+              }
+            }
+          },
+          "primaryDsInfo_": {
+            "OUTPUT": {
+              "layoutDimOrder_": [
+                "mb",
+                "out"
+              ],
+              "stickDimOrder_": [
+                "out"
+              ],
+              "stickSize_": [
+                64
+              ]
+            }
+          },
+          "scheduleTree_": [
+            {
+              "nodeType_": "allocate",
+              "name_": "allocate-Tensor0_hbm",
+              "prev_": "",
+              "ldsIdx_": 0,
+              "component_": "hbm",
+              "layoutDimOrder_": [
+                "mb",
+                "out"
+              ],
+              "maxDimSizes_": [
+                -1,
+                -1
+              ],
+              "startAddressCoreCorelet_": {
+                "dim_prop_func": [
+                  {
+                    "Map": {}
+                  },
+                  {
+                    "Const": {}
+                  },
+                  {
+                    "Const": {}
+                  }
+                ],
+                "dim_prop_attr": [
+                  {
+                    "factor_": 1,
+                    "label_": "core"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "corelet"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "time"
+                  }
+                ],
+                "data_": {
+                  "[0, 0, 0]": "0"
+                }
+              },
+              "coordinates_": {
+                "coordInfo": {
+                  "out": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 2,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1024,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 64,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 16,
+                          "label_": "elem_arr_1"
+                        },
+                        {
+                          "factor_": 64,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "mb": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 512,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 512,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "x": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "coreIdToWkSlice_": {}
+              }
+            },
+            {
+              "nodeType_": "allocate",
+              "name_": "allocate-Tensor1_hbm",
+              "prev_": "",
+              "ldsIdx_": 1,
+              "component_": "hbm",
+              "layoutDimOrder_": [
+                "mb",
+                "out"
+              ],
+              "maxDimSizes_": [
+                -1,
+                -1
+              ],
+              "startAddressCoreCorelet_": {
+                "dim_prop_func": [
+                  {
+                    "Map": {}
+                  },
+                  {
+                    "Const": {}
+                  },
+                  {
+                    "Const": {}
+                  }
+                ],
+                "dim_prop_attr": [
+                  {
+                    "factor_": 1,
+                    "label_": "core"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "corelet"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "time"
+                  }
+                ],
+                "data_": {
+                  "[0, 0, 0]": "17179869184"
+                }
+              },
+              "coordinates_": {
+                "coordInfo": {
+                  "out": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 2,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1024,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 64,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 16,
+                          "label_": "elem_arr_1"
+                        },
+                        {
+                          "factor_": 64,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "mb": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 512,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 512,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "x": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "coreIdToWkSlice_": {}
+              }
+            },
+            {
+              "nodeType_": "allocate",
+              "name_": "allocate-Tensor2_hbm",
+              "prev_": "",
+              "ldsIdx_": 2,
+              "component_": "hbm",
+              "layoutDimOrder_": [
+                "mb",
+                "out"
+              ],
+              "maxDimSizes_": [
+                -1,
+                -1
+              ],
+              "startAddressCoreCorelet_": {
+                "dim_prop_func": [
+                  {
+                    "Map": {}
+                  },
+                  {
+                    "Const": {}
+                  },
+                  {
+                    "Const": {}
+                  }
+                ],
+                "dim_prop_attr": [
+                  {
+                    "factor_": 1,
+                    "label_": "core"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "corelet"
+                  },
+                  {
+                    "factor_": 1,
+                    "label_": "time"
+                  }
+                ],
+                "data_": {
+                  "[0, 0, 0]": "34359738368"
+                }
+              },
+              "coordinates_": {
+                "coordInfo": {
+                  "out": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 2,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1024,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 64,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 16,
+                          "label_": "elem_arr_1"
+                        },
+                        {
+                          "factor_": 64,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "mb": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 512,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 512,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  },
+                  "x": {
+                    "spatial": 3,
+                    "temporal": 0,
+                    "elemArr": 1,
+                    "padding": "nopad",
+                    "folds": {
+                      "dim_prop_func": [
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0
+                          }
+                        },
+                        {
+                          "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0
+                          }
+                        }
+                      ],
+                      "dim_prop_attr": [
+                        {
+                          "factor_": 1,
+                          "label_": "core_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "corelet_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "row_fold"
+                        },
+                        {
+                          "factor_": 1,
+                          "label_": "elem_arr_0"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "coreIdToWkSlice_": {}
+              }
+            }
+          ],
+          "labeledDs_": [
+            {
+              "ldsIdx_": 0,
+              "dsName_": "Tensor0",
+              "dsType_": "OUTPUT",
+              "scale_": [
+                1,
+                1
+              ],
+              "wordLength": 2,
+              "dataFormat_": "SEN169_FP16",
+              "memOrg_": {
+                "hbm": {
+                  "isPresent": 1
+                },
+                "lx": {
+                  "isPresent": 1
+                }
+              }
+            },
+            {
+              "ldsIdx_": 1,
+              "dsName_": "Tensor1",
+              "dsType_": "OUTPUT",
+              "scale_": [
+                -1,
+                1
+              ],
+              "wordLength": 2,
+              "dataFormat_": "SEN169_FP16",
+              "memOrg_": {
+                "hbm": {
+                  "isPresent": 1
+                },
+                "lx": {
+                  "isPresent": 1
+                }
+              }
+            },
+            {
+              "ldsIdx_": 2,
+              "dsName_": "Tensor2",
+              "dsType_": "OUTPUT",
+              "scale_": [
+                1,
+                1
+              ],
+              "wordLength": 2,
+              "dataFormat_": "SEN169_FP16",
+              "memOrg_": {
+                "hbm": {
+                  "isPresent": 1
+                },
+                "lx": {
+                  "isPresent": 1
+                }
+              }
+            }
+          ],
+          "constantInfo_": "{}",
+          "computeOp_": [
+            {
+              "exUnit": "sfp",
+              "opFuncName": "maxnonstick",
+              "attributes_": {
+                "dataFormat_": "SEN169_FP16",
+                "fidelity_": "regular"
+              },
+              "location": "Inner",
+              "inputLabeledDs": [
+                "Tensor0-idx0",
+                "Tensor1-idx1"
+              ],
+              "outputLabeledDs": [
+                "Tensor1-idx1"
+              ]
+            },
+            {
+              "exUnit": "sfp",
+              "opFuncName": "sub",
+              "attributes_": {
+                "dataFormat_": "SEN169_FP16",
+                "fidelity_": "regular"
+              },
+              "location": "Inner",
+              "inputLabeledDs": [
+                "Tensor0-idx0",
+                "Tensor1-idx1"
+              ],
+              "outputLabeledDs": [
+                "Tensor2-idx2"
+              ]
+            },
+            {
+              "exUnit": "sfp",
+              "opFuncName": "exp",
+              "attributes_": {
+                "dataFormat_": "SEN169_FP16",
+                "fidelity_": "regular"
+              },
+              "location": "Inner",
+              "inputLabeledDs": [
+                "Tensor2-idx2"
+              ],
+              "outputLabeledDs": [
+                "Tensor2-idx2"
+              ]
+            },
+            {
+              "exUnit": "sfp",
+              "opFuncName": "sumnonstick",
+              "attributes_": {
+                "dataFormat_": "SEN169_FP16",
+                "fidelity_": "regular"
+              },
+              "location": "Inner",
+              "inputLabeledDs": [
+                "Tensor2-idx2",
+                "Tensor1-idx1"
+              ],
+              "outputLabeledDs": [
+                "Tensor1-idx1"
+              ]
+            },
+            {
+              "exUnit": "sfp",
+              "opFuncName": "realdiv",
+              "attributes_": {
+                "dataFormat_": "SEN169_FP16",
+                "fidelity_": "regular"
+              },
+              "location": "Inner",
+              "inputLabeledDs": [
+                "Tensor2-idx2",
+                "Tensor1-idx1"
+              ],
+              "outputLabeledDs": [
+                "Tensor2-idx2"
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
