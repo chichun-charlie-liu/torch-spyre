@@ -453,10 +453,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'lx' if tensor['lx_addr'] else 'hbm'}",
+                                "name_": f"allocate-Tensor{i}_{'hbm' if tensor['lx_addr'] is None else 'lx'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "lx" if tensor["lx_addr"] else "hbm",
+                                "component_": "hbm" if tensor["lx_addr"] is None else "lx",
                                 "layoutDimOrder_": tensor["dim_infos"].dim_labels,
                                 "maxDimSizes_": [-1] * len(dim_labels),
                                 "startAddressCoreCorelet_": {
