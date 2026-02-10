@@ -51,6 +51,13 @@ class SpyreAsyncCompile:
         outputs = []
         arg_mapping = []
         for index, ts in enumerate(ks.args):
+            # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
+            # in case same Op used twice in sequence and only want pin 1 of them
+            lx_addr = None
+            for k, addr in ts.allocation.items():
+                if kernel_name.split("_")[-1] == k.replace("lx:",""):
+                    lx_addr = addr
+
             if isinstance(ts, ConstantArg):
                 raise RuntimeError("TOOO: implement SDSC generation for constants")
             elif ts.is_input:
@@ -59,7 +66,7 @@ class SpyreAsyncCompile:
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
                         "ddtype": ts.device_layout.device_dtype,
-                        "lx_addr": ts.allocation.get("lx", None),
+                        "lx_addr": lx_addr,
                     }
                 )
                 arg_mapping.append(ts.arg_index)
@@ -69,7 +76,7 @@ class SpyreAsyncCompile:
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
                         "ddtype": ts.device_layout.device_dtype,
-                        "lx_addr": ts.allocation.get("lx", None),
+                        "lx_addr": lx_addr,
                     }
                 )
                 arg_mapping.append(ts.arg_index)
