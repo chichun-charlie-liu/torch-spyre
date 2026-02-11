@@ -33,7 +33,7 @@ class ScratchPadAllocator:
     def __init__(self, size: int = -1):
         # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
         # for backend usage unless specified otherwise
-        if size is -1:
+        if size == -1:
             size = int(
                 (2 << 20) * (1.0 - float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2")))
             )
@@ -68,7 +68,7 @@ class ScratchPadAllocator:
             for i in range(len(sorted_rec) - 1):
                 frag_st = sorted_rec[i]["addr"] + sorted_rec[i]["size"]
                 frag_end = sorted_rec[i + 1]["addr"]
-                if frag_end - frag_st > size_needed:
+                if frag_end - frag_st >= size_needed:
                     return frag_st
             return -1
         else:
