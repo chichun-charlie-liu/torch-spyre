@@ -22,9 +22,12 @@ from torch._inductor.scheduler import (
     SchedulerNode,
 )
 from torch._inductor.virtualized import V
+from torch import Size
 
-
-OPS_GOOD_FOR_LX_REUSE = {"input": {"sub", "div"}, "output": {"max", "sum"}}
+OP_OUTPUT_GOOD_FOR_LX_REUSE = [
+    "max",
+    "sum",
+]  #  "exp"
 
 
 class ScratchPadAllocator:
@@ -75,63 +78,46 @@ class ScratchPadAllocator:
             # cannot find any free blocks
             return -1
 
-    def try_allocate(
-        self, mem_usage: dict, idx: int, org_op_name: str, is_last_node: bool
-    ):
+    def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str):
         """
-        Allocate based on needed mem_usage of the node and then:
-         1. keep a record in self.usage.
-         2. add lx info to corresponding buffer.layout
-        NOTE: 1. assume compiler always allocates inputs before output. Allocate inputs
-                 first then output tensors. Dealloc at then end if inputs are not needed.
-              2. Some unresolved issues still prevent the reuse of main input tensors.
-                 But still need to alloc it on LX first, so that output tensors will not
-                 overlap at lower addr where inputs will reside (entirely or partial).
-              3. LX reuse strategy could vary for the same buffer on different Op. e.g.
-                 arg0 at op MAX is the 1st time this buffer is used => can not be found
-                 on LX and has to be loaded from HBM. But the following op SUB may be
-                 able to reuse it from LX without reaching HBM again. => include Node Idx
-                 (sequence in nodes) and verify it when generating sdsc
-
-        TODO: may need to utilize info from previous Op's sdsc.out.out.out.json
+        Simple reuse rule:
+        1. for an "input" tensor, found a matched tensor (name and size) on LX
+        2. for an output tensor, if this op is on the "white list" => prep for pinning
+            => alloc a new LX block for the "output" of the op
+        If can_reuse => add lx info to corresponding buffer.layout
+        NOTE: 1. deeptool LX partition issue was fixed on 260220 (commit #?).
+              2. if an op, e.g. max, occurs multiple times on graph, output buffers will
+                 have different names -> end-of-life analysis will take care of dealloc
+        TODO: 1. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
+              2. may be able to generalize this decision in buf end-of-life analysis
         """
-        lx_alloc_to_del = []
+        graph_output_buf_name = V.graph.get_output_names()
         for tensor_name, needed in mem_usage.items():
-            # find the current LX usage of this tensor name, if exists
-            lx_rec = self.usage.get(tensor_name, {})
+            if tensor_name == graph_output_buf_name:
+                continue  # graph output has to go back to HBM
 
-            if lx_rec and lx_rec["size"] == needed["size"]:
-                # same tensor name and size is on scratchpad already, reuse it
-                addr = lx_rec["addr"]
+            # Decide whether to reuse.
+            addr = -1
+            if needed["is_input"]:
+                if (
+                    tensor_name in self.usage
+                    and self.usage[tensor_name]["size"] == needed["size"]
+                ):
+                    addr = self.usage[tensor_name]["addr"]
             else:
-                # new allocation or overwrite the existing one
-                addr = self.find_free_block(needed["size"])
-                if addr == -1:
-                    # no further action if allocation failed
-                    continue
+                if any(
+                    op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                ) or needed.get("clone_to_lx", False):
+                    addr = self.find_free_block(needed["size"])
 
-            self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
+            # can reuse (i.e., input found on lx or output alloc succeeded), add lx info
+            # into V.graph.buffers.layout for later codegen use.
+            if addr != -1:
+                self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
 
-            # Decide whether to reuse. For now, only allow ops we've tested successfully.
-            # TODO may be able to generalize this decision in buf end-of-life analysis
-            in_or_out = "input" if needed["is_input"] else "output"
-            can_reuse = any(
-                op in org_op_name for op in OPS_GOOD_FOR_LX_REUSE[in_or_out]
-            )
-            # Special cases check:
-            # 1) tensor-to-be-reused is input but not on LX, or
-            # 2) output can reuse but is last node (make sure it'll go back to HBM)
-            if (needed["is_input"] and lx_rec == {}) or (
-                not needed["is_input"] and is_last_node
-            ):
-                can_reuse = False
-
-            # Directly add the lx info into V.graph.buffers.layout for later codegen use.
-            force_pinning = False  # DEBUG use only, e.g. idx==1
-            if can_reuse or force_pinning:
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
-                layout.allocation[f"lx:{idx}"] = addr  # see doctring Note 3
+                layout.allocation[f"lx:{idx}"] = addr  # node idx is for debugging
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {
@@ -142,10 +128,6 @@ class ScratchPadAllocator:
                         "size": needed["size"],
                     }
                 )
-            else:
-                lx_alloc_to_del.append(tensor_name)
-        # see docstring NOTE 2
-        self.deallocate(lx_alloc_to_del)
 
     def deallocate(self, bufs: list[str]):
         """Try to deallocate each of the buffers in a list, if exists."""
@@ -181,15 +163,18 @@ def consider_for_scratchpad(
     n: SchedulerNode,
     alloc: ScratchPadAllocator,
     idx: int,
-    is_last_node: bool,
 ):
     # 1. summarize both inputs and output sizes used by this node.
     mem_usage = mem_usage_by_node(n)
 
+    org_node = n.node.origin_node
+    # [hack] proof of concept, clone tensor from hbm to lx for reuse
+    if "mul" in org_node.name and org_node.args[1].meta["val"].shape == Size([1]):
+        mem_usage[n.node.name]["clone_to_lx"] = True
+
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
-    org_op_name = n.node.origin_node.name
-    alloc.try_allocate(mem_usage, idx, org_op_name, is_last_node)
+    alloc.try_allocate(mem_usage, idx, org_node.name)
 
 
 def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
@@ -224,12 +209,34 @@ def scratchpad_planning(
 
     node_idx_to_dealloc_bufs = buf_end_of_life_analysis(nodes)
 
+    # fx_graph = V.graph.graph
+    # fx_nodes = list(fx_graph.nodes)
+    # fx_graph.inserting_before(fx_nodes[1])  # node[0] is placeholder for inputs
+    # new_fx_node = fx_graph.create_node("call_function", lambda x: x, fx_nodes[1].args )  # identity
+    # fx_nodes[1].args = (new_fx_node,)
+    # V.graph.orig_gm.recompile()
+    # # at this point, fx graph is updated but GraphLowering has not.
+
+    # tmp = ExternKernel.copy_input(nodes[0].node)  # create a PW TensorBox from a ComputedBuffer
+    # com_buf = tmp.data.data
+    # com_buf.origin_node = new_fx_node
+    # com_buf.origins.add(new_fx_node)
+    # curr_sch = nodes[0].scheduler
+    # sch_node = SchedulerNode(curr_sch, com_buf)
+    # propagate_spyre_tensor_layouts([sch_node])
+    # # min_order will be used for nodes sorting later
+    # sch_node.min_order = nodes[0].min_order - 1
+    # nodes = [sch_node] + nodes
+    # # update name_to_buf mapping
+    # curr_sch.name_to_buf = {
+    #     buf.get_name(): buf for node in nodes for buf in node.get_outputs()
+    # }
+
     for idx, n in enumerate(nodes):
         # release unneeded LX allocations before actual planning
         alloc.deallocate(node_idx_to_dealloc_bufs.get(idx, []))
-        is_last_node = idx == len(nodes) - 1
 
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            consider_for_scratchpad(n, alloc, idx, is_last_node)
+            consider_for_scratchpad(n, alloc, idx)
     # print(alloc.lx_usage_hist)
     return nodes

@@ -27,18 +27,21 @@ cpu_result = torch.softmax(x, dim=0)
 x_device = x.to(DEVICE)
 
 # Compute softmax on the device in eager mode and get the result back to the host
-eager_result = torch.softmax(x_device, dim=0).cpu()
+# eager_result = torch.softmax(x_device, dim=0).cpu()
 
 # Compute softmax on the device in compiled mode and get the result back to the host
-compiled_sm = torch.compile(lambda a: torch.softmax(a, dim=0))
+# compiled_sm = torch.compile(lambda a: torch.softmax(a, dim=0))
+# ten1_dev = torch.tensor(1, dtype=torch.float16).to(DEVICE)
+# compiled_sm = torch.compile(lambda a: torch.softmax(a * ten1_dev, dim=0))
+compiled_sm = torch.compile(lambda a: torch.softmax(a.clone(), dim=0))
 compiled_result = compiled_sm(x_device).cpu()
 
 # Print the results and compare them
 print(f"CPU result\n{cpu_result}")
-print(f"Spyre Eager result\n{eager_result}")
+# print(f"Spyre Eager result\n{eager_result}")
 print(f"Spyre Compiled result\n{compiled_result}")
-device_delta = torch.abs(eager_result - compiled_result).max()
+# device_delta = torch.abs(eager_result - compiled_result).max()
 cpu_delta = torch.abs(compiled_result - cpu_result).max()
 
 print(f"Max delta Compiled Spyre vs. CPU: {cpu_delta}")
-print(f"Max delta Compiled Spyre vs. Eager Spyre: {device_delta}")
+# print(f"Max delta Compiled Spyre vs. Eager Spyre: {device_delta}")
