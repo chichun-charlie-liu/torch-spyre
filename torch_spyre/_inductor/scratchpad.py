@@ -20,14 +20,17 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
+    NodeUser,
 )
 from torch._inductor.virtualized import V
-from torch import Size
+from torch import ops
+from .stickify import propagate_spyre_tensor_layouts
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
     "sum",
-]  #  "exp"
+    "clone",
+]
 
 
 class ScratchPadAllocator:
@@ -53,6 +56,12 @@ class ScratchPadAllocator:
         if len(self.usage) > 0:
             return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
         return None
+
+    def get_available_total(self):
+        total_avail = self.limit
+        for rec in self.usage.values():
+            total_avail -= rec["size"]
+        return total_avail
 
     def find_free_block(self, size_needed: int):
         # cannot perform defragmentation yet, will add more cases in the future
@@ -85,33 +94,29 @@ class ScratchPadAllocator:
         2. for an output tensor, if this op is on the "white list" => prep for pinning
             => alloc a new LX block for the "output" of the op
         If can_reuse => add lx info to corresponding buffer.layout
-        NOTE: 1. deeptool LX partition issue was fixed on 260220 (commit #?).
-              2. if an op, e.g. max, occurs multiple times on graph, output buffers will
+        NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
                  have different names -> end-of-life analysis will take care of dealloc
-        TODO: 1. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
-              2. may be able to generalize this decision in buf end-of-life analysis
+              2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
+              3. may be able to generalize this decision in buf end-of-life analysis
+              4. greedy alloc may cause fragments, can further improve
         """
         graph_output_buf_name = V.graph.get_output_names()
         for tensor_name, needed in mem_usage.items():
-            if tensor_name == graph_output_buf_name:
+            if tensor_name in graph_output_buf_name:
                 continue  # graph output has to go back to HBM
 
             # Decide whether to reuse.
             addr = -1
-            if needed["is_input"]:
-                if (
-                    tensor_name in self.usage
-                    and self.usage[tensor_name]["size"] == needed["size"]
-                ):
-                    addr = self.usage[tensor_name]["addr"]
-            else:
-                if any(
-                    op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
-                ) or needed.get("clone_to_lx", False):
-                    addr = self.find_free_block(needed["size"])
+            tensor_on_lx = self.usage.get(tensor_name, {})
+            size_match = tensor_on_lx.get("size", 0) == needed["size"]
+            allowed_output_op = any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
 
-            # can reuse (i.e., input found on lx or output alloc succeeded), add lx info
-            # into V.graph.buffers.layout for later codegen use.
+            if needed["is_input"] and tensor_on_lx and size_match:
+                addr = self.usage[tensor_name]["addr"]
+            elif not needed["is_input"] and allowed_output_op:
+                addr = self.find_free_block(needed["size"])
+
+            # add lx info into V.graph.buffers.layout for later codegen use.
             if addr != -1:
                 self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
 
@@ -167,14 +172,10 @@ def consider_for_scratchpad(
     # 1. summarize both inputs and output sizes used by this node.
     mem_usage = mem_usage_by_node(n)
 
-    org_node = n.node.origin_node
-    # [hack] proof of concept, clone tensor from hbm to lx for reuse
-    if "mul" in org_node.name and org_node.args[1].meta["val"].shape == Size([1]):
-        mem_usage[n.node.name]["clone_to_lx"] = True
-
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
-    alloc.try_allocate(mem_usage, idx, org_node.name)
+    org_op_name = n.node.origin_node.target._opname
+    alloc.try_allocate(mem_usage, idx, org_op_name)
 
 
 def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
@@ -183,9 +184,11 @@ def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
     Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
     """
     last_used: dict = {}
+    occurence: dict = {}
     for idx, n in enumerate(nodes):
         for buf in n.used_buffer_names():  # just buf names
             last_used[buf] = idx
+            occurence[buf] = occurence.get(buf, 0) + 1
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -198,6 +201,118 @@ def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
     return bufs_to_dealloc_at_idx
 
 
+def try_clone_input_to_lx(
+    nodes: list[BaseSchedulerNode],
+    lx_free_total: int,
+) -> list[BaseSchedulerNode]:
+    """
+    Check if any input tensors can fit onto scratchpad and needed more than once =>
+    add corresponding "clone" node.
+    NOTE check Scheduler._replace_node() and fuse_nodes_once() for important items that
+        need to be updated.
+    """
+
+    graph_lowering = V.graph
+    scheduler = V.graph.scheduler
+    fx_graph = V.graph.graph
+    fx_non_arg_nodes = []
+    fx_arg_nodes = {}
+    for n in fx_graph.nodes:
+        if n.op == "placeholder":
+            fx_arg_nodes[n.name] = n
+        else:
+            fx_non_arg_nodes.append(n)
+
+    for inp_name in V.graph.graph_input_names:
+
+        buf = V.graph.get_buffer(inp_name)
+        dev_layout = buf.layout.device_layout
+        dev_size = math.prod(dev_layout.device_size[:-1]) * 128
+
+        # Step 0: check how many times this buffer will be read, decide cloning or not
+        nodes_to_be_updated = []
+        num_read = 0
+        for n in nodes:
+            if inp_name in [r.name for r in n.read_writes.reads]:
+                num_read += 1
+                nodes_to_be_updated.append(n)
+
+        if num_read == 1 or dev_size > lx_free_total:
+            continue
+
+        # step 1: create a new FX node on FX graph and then refresh dependencies
+        fx_inp = fx_arg_nodes[inp_name]
+        old_users = list(fx_inp.users.keys())    # get old users before insertion
+        fx_graph.inserting_before(fx_non_arg_nodes[0])
+        new_fx_node = fx_graph.create_node(
+            "call_function", ops.aten.clone.default, (fx_inp,)
+        )
+        # update user nodes' .args attr
+        for user in old_users:
+            user.args = tuple(new_fx_node if ar is fx_inp else ar for ar in user.args)
+        V.graph.orig_gm.recompile()
+
+        # step 2: Use the new FX node -> new TensorBox -> new SchedulerNode
+        # NOTE .run_node(n) needs a {fx nodes: TensorBox} mapping for each elem in n.args
+        # e.g. new_fx_node.args=(fx_inp,), i.e. arg0_1 -> point to arg0_1's TensorBox
+        for tb in graph_lowering.name_to_users[inp_name]:
+            tb_fx_node = list(tb.data.origins)[0]
+            graph_lowering.env[tb_fx_node] = tb
+            # all TBs related to inp_name are added, except the new TB below
+        # graph_lowering.args_iter = graph_lowering.example_inputs  # was needed for something?
+        new_tb = graph_lowering.run_node(new_fx_node)
+        com_buf = new_tb.data.data
+        new_sch_node = scheduler.create_scheduler_node(com_buf)
+        propagate_spyre_tensor_layouts([new_sch_node])
+        new_buf_name = com_buf.name
+        graph_lowering.env[new_fx_node] = new_tb
+
+        # Update graph_lowering.name_to_users[inp_name] (arg0_1). Except the InpBuf and
+        # the new_buf, the rest should become users of new_buf
+        users_of_inp, users_of_new_buf = [], []
+        for tb in graph_lowering.name_to_users[inp_name]:
+            if tb.data.data.name in [inp_name, new_buf_name]:
+                users_of_inp.append(tb)
+            else:
+                users_of_new_buf.append(tb)
+        graph_lowering.name_to_users[inp_name] = users_of_inp
+        graph_lowering.name_to_users[new_buf_name] = users_of_new_buf
+
+        # 3 Update dependencies that accessed arg0_1 -> new_buf
+        for n in nodes_to_be_updated:  # n is a SchedulerNode
+            # 3-1 update LoopIR.inner_fn under CompBuf.
+            # NOTE cannot be updated directly => create new CompBuf to get new LoopIR
+            n_fx = n.node.data.origin_node  # args of this fx node are up-to-date
+            old_com_buf = n.node
+            new_tb_n = graph_lowering.run_node(n_fx)
+            new_com_buf_n = new_tb_n.data.data            
+            old_com_buf.data = new_com_buf_n.data
+            # must clear cached body or it will not refresh _body and n.read_writes
+            old_com_buf.get_default_sizes_body.clear_cache(old_com_buf)
+            n.recompute_size_and_body()
+
+            # clean up tables to remove the unwanted items due to new TB created above
+            del graph_lowering.name_to_op[new_com_buf_n.operation_name]
+            del graph_lowering.name_to_buffer[new_com_buf_n.name]
+            graph_lowering.name_to_users[new_buf_name].pop(-1)
+
+            new_sch_node.outputs[0].users.append(NodeUser(n, False, False))
+
+        # other items to update
+        new_sch_node.min_order = nodes[0].min_order - 1
+        new_sch_node.max_order = nodes[0].max_order - 1
+        nodes = [new_sch_node] + nodes
+        scheduler.nodes = nodes
+        # scheduler.nodes = scheduler.topological_sort_schedule(scheduler.nodes)
+        # scheduler.prune_redundant_deps(scheduler.nodes)
+        scheduler.name_to_node = {n.get_name():n for n in scheduler.nodes}
+        scheduler.name_to_fused_node = scheduler.name_to_node
+        scheduler.name_to_buf.update(new_sch_node.outputs_by_name)
+        lx_free_total -= dev_size
+
+    return nodes
+
+
 def scratchpad_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -207,30 +322,8 @@ def scratchpad_planning(
 
     alloc = ScratchPadAllocator()
 
+    nodes = try_clone_input_to_lx(nodes, alloc.get_available_total())
     node_idx_to_dealloc_bufs = buf_end_of_life_analysis(nodes)
-
-    # fx_graph = V.graph.graph
-    # fx_nodes = list(fx_graph.nodes)
-    # fx_graph.inserting_before(fx_nodes[1])  # node[0] is placeholder for inputs
-    # new_fx_node = fx_graph.create_node("call_function", lambda x: x, fx_nodes[1].args )  # identity
-    # fx_nodes[1].args = (new_fx_node,)
-    # V.graph.orig_gm.recompile()
-    # # at this point, fx graph is updated but GraphLowering has not.
-
-    # tmp = ExternKernel.copy_input(nodes[0].node)  # create a PW TensorBox from a ComputedBuffer
-    # com_buf = tmp.data.data
-    # com_buf.origin_node = new_fx_node
-    # com_buf.origins.add(new_fx_node)
-    # curr_sch = nodes[0].scheduler
-    # sch_node = SchedulerNode(curr_sch, com_buf)
-    # propagate_spyre_tensor_layouts([sch_node])
-    # # min_order will be used for nodes sorting later
-    # sch_node.min_order = nodes[0].min_order - 1
-    # nodes = [sch_node] + nodes
-    # # update name_to_buf mapping
-    # curr_sch.name_to_buf = {
-    #     buf.get_name(): buf for node in nodes for buf in node.get_outputs()
-    # }
 
     for idx, n in enumerate(nodes):
         # release unneeded LX allocations before actual planning
