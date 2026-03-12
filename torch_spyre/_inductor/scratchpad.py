@@ -255,10 +255,15 @@ def try_clone_input_to_lx(
         # step 2: Use the new FX node -> new TensorBox -> new SchedulerNode
         # NOTE .run_node(n) needs a {fx nodes: TensorBox} mapping for each elem in n.args
         # e.g. new_fx_node.args=(fx_inp,), i.e. arg0_1 -> point to arg0_1's TensorBox
-        for tb in graph_lowering.name_to_users[inp_name]:
-            tb_fx_node = list(tb.data.origins)[0]
-            graph_lowering.env[tb_fx_node] = tb
-            # all TBs related to inp_name are added, except the new TB below
+        env = {}
+        for tbs in graph_lowering.name_to_users.values():
+            for tb in tbs:
+                tb_fx_node = list(tb.data.origins)[0]
+                if tb_fx_node in env and env[tb_fx_node] is not tb:
+                    raise ValueError("A TensorBox has more than 1 associated FX node.")
+                env[tb_fx_node] = tb
+        graph_lowering.env.update(env)
+        # all TBs related to inp_name are added, except the new TB below
         # graph_lowering.args_iter = graph_lowering.example_inputs  # was needed for something?
         new_tb = graph_lowering.run_node(new_fx_node)
         com_buf = new_tb.data.data
