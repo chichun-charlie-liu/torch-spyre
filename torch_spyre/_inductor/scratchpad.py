@@ -17,6 +17,7 @@ import os
 from torch._inductor.ir import (
     ComputedBuffer,
 )
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
@@ -201,60 +202,103 @@ def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
     return bufs_to_dealloc_at_idx
 
 
+class NameSwapHandler(WrapperHandler):
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
+
+
+def create_Loop_hack_inner_fn(old_Loop, name_map):
+    """ Use ops_handler to swap the name of buffers"""
+    def new_inner_fn(*args):
+        # Pointwise has 1 pos arg index while Reduction has 2, i.e. (index, rindex)
+        with V.set_ops_handler(NameSwapHandler(V.ops, name_map)):
+            return old_Loop.inner_fn(*args)
+
+    # old_Loop could be a Pointwise or Reduction.
+    kwargs = {k: getattr(old_Loop, k) for k in old_Loop.__dataclass_fields__.keys()}
+    kwargs["inner_fn"] = new_inner_fn
+    new_Loop = old_Loop.__class__(**kwargs) 
+    # Additional attr that are not included in dataclass_fields. NOTE it relies on a
+    # special method to force reset attrs of a frozen dataclass, see ir.Loops.create()
+    new_Loop._post_init_setattr("origins", old_Loop.origins)
+    new_Loop._post_init_setattr("origin_node", old_Loop.origin_node)
+    new_Loop._post_init_setattr("traceback", old_Loop.traceback)
+    # .get_stack_traces() get info from "origins", no need to manually set anything
+    # LoopBody will be created later when we call CompBuf.recompute()
+
+    return new_Loop
+
+
 def try_clone_input_to_lx(
     nodes: list[BaseSchedulerNode],
     lx_free_total: int,
 ) -> list[BaseSchedulerNode]:
     """
     Check if any input tensors can fit onto scratchpad and needed more than once =>
-    add corresponding "clone" node.
-    NOTE check Scheduler._replace_node() and fuse_nodes_once() for important items that
-        need to be updated.
+    add corresponding "clone" node so that we can reuse it from scratchpad.
+
+    During the lowering process, FX nodes are interpreted into SchedulerNodes, but info
+    added on SchedulerNodes may not be entirely back-propogated to FX graph, e.g. a
+    SchedulerNode could be created without a corresponding FX node. It would be safer
+    not to directly rely on FX graph when possible. For example:
+    1. if we need to know the users of a schedulerNode, better check node.read_writes
+        instead of origin_node.args.
+    2. if we need a new LoopIR for a given schedulerNode, we could make changes to its
+        corresponding FX node then utilize GraphLowering.run_node(updated_fx_node) ->
+        new CompBuf -> new LoopIR. But in case corresponding FX node has defect to begin
+        with, we chose to hack the inner_fn then build a new LoopIR from there.
+    NOTE:
+    - ONCE WE correctly updated args in "node.data(i.e. a LoopIR).inner_fn", 
+      node.read_writes and node._body can be refreshed by calling node.recompute_body().
+      But need to make sure to clear cached body first.
+    - check Scheduler._replace_node() and fuse_nodes_once() for hints of important items
+      that need to be updated.
     """
 
     graph_lowering = V.graph
     scheduler = V.graph.scheduler
     fx_graph = V.graph.graph
-    fx_non_arg_nodes = []
-    fx_arg_nodes = {}
-    for n in fx_graph.nodes:
-        if n.op == "placeholder":
-            fx_arg_nodes[n.name] = n
-        else:
-            fx_non_arg_nodes.append(n)
+
+    buf_read_counts = {}
+    buf_users = {}
+    for n in nodes:
+        reads = n.get_read_write_buffer_accesses(
+            include_reads=True, include_writes=False
+        )
+        for b in reads.keys():
+            buf_read_counts[b] = buf_read_counts.get(b, 0) + 1
+            buf_users[b] = buf_users.get(b, [])
+            buf_users[b].append(n)  # TODO a node cannot read the same buf twice? no need to dedup?
 
     for inp_name in V.graph.graph_input_names:
 
+        # Step 0: check how many times this buffer will be read, decide cloning or not
         buf = V.graph.get_buffer(inp_name)
         dev_layout = buf.layout.device_layout
         dev_size = math.prod(dev_layout.device_size[:-1]) * 128
-
-        # Step 0: check how many times this buffer will be read, decide cloning or not
-        nodes_to_be_updated = []
-        num_read = 0
-        for n in nodes:
-            if inp_name in [r.name for r in n.read_writes.reads]:
-                num_read += 1
-                nodes_to_be_updated.append(n)
-
-        if num_read == 1 or dev_size > lx_free_total:
+        is_on_lx = buf.layout.allocation != {}
+        if buf_read_counts[inp_name] == 1 or dev_size > lx_free_total or is_on_lx:
             continue
 
         # step 1: create a new FX node on FX graph and then refresh dependencies
-        fx_inp = fx_arg_nodes[inp_name]
+        fx_inp = list(buf.origins)[0]
         old_users = list(fx_inp.users.keys())    # get old users before insertion
-        fx_graph.inserting_before(fx_non_arg_nodes[0])
+        fx_graph.inserting_after(fx_inp)
         new_fx_node = fx_graph.create_node(
             "call_function", ops.aten.clone.default, (fx_inp,)
         )
-        # update user nodes' .args attr
+        # update user's input (nodes.args is a tuple of fx nodes)
         for user in old_users:
             user.args = tuple(new_fx_node if ar is fx_inp else ar for ar in user.args)
         V.graph.orig_gm.recompile()
 
         # step 2: Use the new FX node -> new TensorBox -> new SchedulerNode
         # NOTE .run_node(n) needs a {fx nodes: TensorBox} mapping for each elem in n.args
-        # e.g. new_fx_node.args=(fx_inp,), i.e. arg0_1 -> point to arg0_1's TensorBox
+        # e.g. new_fx_node.args=(arg0, ), env[arg0_1] -> point to arg0_1's TensorBox
         env = {}
         for tbs in graph_lowering.name_to_users.values():
             for tb in tbs:
@@ -263,8 +307,7 @@ def try_clone_input_to_lx(
                     raise ValueError("A TensorBox has more than 1 associated FX node.")
                 env[tb_fx_node] = tb
         graph_lowering.env.update(env)
-        # all TBs related to inp_name are added, except the new TB below
-        # graph_lowering.args_iter = graph_lowering.example_inputs  # was needed for something?
+        # graph_lowering.args_iter = graph_lowering.example_inputs  # doesn't seem needed anymore?
         new_tb = graph_lowering.run_node(new_fx_node)
         com_buf = new_tb.data.data
         new_sch_node = scheduler.create_scheduler_node(com_buf)
@@ -272,8 +315,8 @@ def try_clone_input_to_lx(
         new_buf_name = com_buf.name
         graph_lowering.env[new_fx_node] = new_tb
 
-        # Update graph_lowering.name_to_users[inp_name] (arg0_1). Except the InpBuf and
-        # the new_buf, the rest should become users of new_buf
+        # Update graph_lowering.name_to_users[inp_name] (a list of TensorBox). Existing
+        # users of arg0, other than InpBuf and new_buf, should become users of new_buf.
         users_of_inp, users_of_new_buf = [], []
         for tb in graph_lowering.name_to_users[inp_name]:
             if tb.data.data.name in [inp_name, new_buf_name]:
@@ -283,30 +326,26 @@ def try_clone_input_to_lx(
         graph_lowering.name_to_users[inp_name] = users_of_inp
         graph_lowering.name_to_users[new_buf_name] = users_of_new_buf
 
-        # 3 Update dependencies that accessed arg0_1 -> new_buf
-        for n in nodes_to_be_updated:  # n is a SchedulerNode
-            # 3-1 update LoopIR.inner_fn under CompBuf.
-            # NOTE cannot be updated directly => create new CompBuf to get new LoopIR
-            n_fx = n.node.data.origin_node  # args of this fx node are up-to-date
-            old_com_buf = n.node
-            new_tb_n = graph_lowering.run_node(n_fx)
-            new_com_buf_n = new_tb_n.data.data            
-            old_com_buf.data = new_com_buf_n.data
-            # must clear cached body or it will not refresh _body and n.read_writes
+        # Step 3: Update user nodes of arg0_1 -> change it to new_buf
+        for n_user in buf_users[inp_name]:
+            old_com_buf = n_user.node
+            # hack inner_fn with a nameSwapper ops handler and make a new LoopIR
+            new_Loop = create_Loop_hack_inner_fn(
+                old_com_buf.data, name_map={inp_name: new_buf_name}
+            )
+            old_com_buf.data = new_Loop
+            # must clear cached body or recompute() will not do anything
             old_com_buf.get_default_sizes_body.clear_cache(old_com_buf)
-            n.recompute_size_and_body()
+            n_user.recompute_size_and_body()
 
-            # clean up tables to remove the unwanted items due to new TB created above
-            del graph_lowering.name_to_op[new_com_buf_n.operation_name]
-            del graph_lowering.name_to_buffer[new_com_buf_n.name]
-            graph_lowering.name_to_users[new_buf_name].pop(-1)
-
-            new_sch_node.outputs[0].users.append(NodeUser(n, False, False))
+            new_sch_node.outputs[0].users.append(NodeUser(n_user, False, False))
 
         # other items to update
-        new_sch_node.min_order = nodes[0].min_order - 1
-        new_sch_node.max_order = nodes[0].max_order - 1
-        nodes = [new_sch_node] + nodes
+        first_user = buf_users[inp_name][0]
+        new_sch_node.min_order = first_user.min_order - 0.5
+        new_sch_node.max_order = first_user.max_order - 0.5
+        idx_to_first_user = nodes.index(first_user)
+        nodes.insert(idx_to_first_user, new_sch_node)
         scheduler.nodes = nodes
         # scheduler.nodes = scheduler.topological_sort_schedule(scheduler.nodes)
         # scheduler.prune_redundant_deps(scheduler.nodes)
