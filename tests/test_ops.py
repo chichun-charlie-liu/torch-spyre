@@ -734,6 +734,34 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
+    def test_linear_2d_no_bias(self):
+        x = torch.randn(67, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=False, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_2d_bias(self):
+        x = torch.randn(67, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=True, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_3d_no_bias(self):
+        x = torch.randn(3, 17, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=False, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_3d_bias(self):
+        x = torch.randn(3, 17, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=True, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
         def test_op(declaration):

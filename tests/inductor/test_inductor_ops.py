@@ -989,6 +989,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
             },
         },
+        ("test_linear", "test_linear_fn"): {
+            "param_sets": {
+                "2d_no_bias": (
+                    cached_randn((67, 256)),
+                    cached_randn((128, 256)),
+                    None,
+                ),
+                "2d_bias": (
+                    cached_randn((67, 256)),
+                    cached_randn((128, 256)),
+                    cached_randn((128,)),
+                ),
+                "3d_no_bias": (
+                    cached_randn((3, 17, 256)),
+                    cached_randn((128, 256)),
+                    None,
+                ),
+                "3d_bias": (
+                    cached_randn((3, 17, 256)),
+                    cached_randn((128, 256)),
+                    cached_randn((128,)),
+                ),
+            }
+        },
+        ("test_tril", "test_tril_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((64, 64)),),
+                "3d": (cached_randn((32, 64, 64)),),
+            }
+        },
+        ("test_triu", "test_triu_cpu"): {
+            "param_sets": {
+                "2d": (
+                    cached_randn((64, 64)),
+                    1,
+                ),
+                "3d": (
+                    cached_randn((32, 64, 64)),
+                    1,
+                ),
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1065,6 +1107,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_binary_op_cpu(self, op, x, y):
         compare_with_cpu(op, x, y)
+
+    def test_linear_fn(self, x, weight, bias):
+        compare_with_cpu(torch.nn.functional.linear, x, weight, bias)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -1222,6 +1267,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.softplus(input, beta, threshold)
 
         compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_tril_cpu(self, x):
+        def fn(input):
+            return torch.tril(input)
+
+        compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_triu_cpu(self, x, diagonal):
+        def fn(input, diagonal):
+            return torch.triu(input, diagonal)
+
+        compare_with_cpu(fn, x, diagonal)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

@@ -36,8 +36,10 @@ spyre_decompositions: dict = {}
 # Some Inductor decompositions do not work reliably on the Spyre backend yet.
 # We disable them here and rely on implicit fallbacks to eager ops instead. Once
 # the blocking issues are resolved, these exclusions can be removed.
-#
-spyre_decompositions_to_exclude: list = []
+spyre_decompositions_to_exclude = [
+    torch.ops.aten.triu,
+    torch.ops.aten.tril,
+]
 
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
 spyre_decompositions_via_dispatchkey: dict = {}
@@ -497,6 +499,19 @@ def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     return torch.ops.spyre.softplus(input, beta, threshold)
+
+
+@register_spyre_decomposition([torch.ops.aten.linear.default])
+def spyre_linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    weight = weight.transpose(-1, -2).contiguous()
+    while weight.dim() < input.dim():
+        weight = torch.unsqueeze(weight, 0)
+    out = input @ weight
+    if bias is not None:
+        out = out + bias
+    return out
 
 
 ###############################################################################################
