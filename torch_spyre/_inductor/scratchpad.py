@@ -233,13 +233,13 @@ def create_Loop_hack_inner_fn(old_Loop, name_map):
     return new_Loop
 
 
-def try_clone_input_to_lx(
+def try_insert_clone_nodes_for_inputs(
     nodes: list[BaseSchedulerNode],
     lx_free_total: int,
 ) -> list[BaseSchedulerNode]:
     """
     Check if any input tensors can fit onto scratchpad and needed more than once =>
-    add corresponding "clone" node so that we can reuse it from scratchpad.
+    Add corresponding "clone" node to copy it to scratchpad and reduce reading from HBM.
 
     During the lowering process, FX nodes are interpreted into SchedulerNodes, but info
     added on SchedulerNodes may not be entirely back-propogated to FX graph, e.g. a
@@ -366,7 +366,7 @@ def scratchpad_planning(
 
     alloc = ScratchPadAllocator()
 
-    nodes = try_clone_input_to_lx(nodes, alloc.get_available_total())
+    nodes = try_insert_clone_nodes_for_inputs(nodes, alloc.get_available_total())
     node_idx_to_dealloc_bufs = buf_end_of_life_analysis(nodes)
 
     for idx, n in enumerate(nodes):
