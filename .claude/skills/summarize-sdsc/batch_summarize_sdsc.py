@@ -19,6 +19,7 @@ import json
 import sys
 from pathlib import Path
 from collections import defaultdict
+from tabulate import tabulate
 
 
 def _extract_tensor_idx_to_role(op_data: dict) -> dict:
@@ -266,127 +267,35 @@ def batch_summarize_directory(base_dir_str: str) -> None:
     else:
       stats["files_skipped"] += 1
 
-  # Print operations table
+  # Build tensor summary table using tabulate
   if all_ops:
-    print("All Operations Table (with Tensor Allocations):")
-    print("=" * 300)
+    print("Tensor Summary Table (One row per tensor allocation):")
+    print()
 
-    # Use shorter file paths - just the kernel directory
-    file_col_width = 35
-
-    header = (
-        f"{'Kernel':<{file_col_width}} | {'Op':<15} | {'Cores':<5} | "
-        f"{'Tensor':<20} | {'Role':<8} | {'Component':<12} | {'Address':<15} | {'Layout':<20}"
-    )
-    print(header)
-    print("-" * 300)
-
-    for op in all_ops:
-      # Extract just the kernel directory name (e.g., "sdsc_fused_0_ahpi_5jb")
-      parts = op['file'].split('/')
-      kernel_name = parts[0] if parts else op['file']
-      file_short = kernel_name if len(kernel_name) <= file_col_width else kernel_name[:file_col_width-3] + "..."
-
-      # If no tensors, show operation summary
-      if not op["tensors"]:
-        print(
-            f"{file_short:<{file_col_width}} | {op['op_name']:<15} | "
-            f"{op['cores']:<5} | {'':<20} | {'':<8} | {'':<12} | {op['address']:<15} | {'':<20}"
-        )
-      else:
-        # For each tensor with its allocations, create a row per allocation
-        for tensor_idx, tensor in enumerate(op["tensors"]):
-          # Show op/file/cores only on first row of operation
-          op_label = op['op_name'] if tensor_idx == 0 else ""
-          file_label = file_short if tensor_idx == 0 else ""
-          cores_label = str(op['cores']) if tensor_idx == 0 else ""
-
-          print(
-              f"{file_label:<{file_col_width}} | {op_label:<15} | "
-              f"{cores_label:<5} | {tensor['name']:<20} | {tensor['role']:<8} | "
-              f"{tensor['component']:<12} | {tensor['address']:<15} | {tensor['layout']:<20}"
-          )
-
-    print("=" * 300)
-
-    # Print tensor summary table - one row per unique tensor allocation
-    print("\n\nTensor Summary Table (One row per tensor allocation):")
-    table_width = 155
-    print("=" * table_width)
-
-    tensor_header = (
-        f"{'Op':<20} | {'Tensor Name':<20} | {'Role':<10} | {'Layout':<20} | "
-        f"{'Sticks':<15} | {'Component':<12} | {'Address':<15}"
-    )
-    print(tensor_header)
-    print("-" * table_width)
-
+    table_rows = []
     for op_idx, op in enumerate(all_ops):
       op_name = op['op_name']
+      # Extract just the kernel directory name
+      parts = op['file'].split('/')
+      kernel_name = parts[0] if parts else op['file']
       if op["tensors"]:
-        # Print one row per tensor allocation
+        # Add one row per tensor allocation
         for alloc_idx, tensor in enumerate(op["tensors"]):
           op_label = op_name if alloc_idx == 0 else ""
-          print(
-              f"{op_label:<20} | {tensor['name']:<20} | {tensor['role']:<10} | "
-              f"{tensor['layout']:<20} | {tensor['sticks']:<15} | "
-              f"{tensor['component']:<12} | {tensor['address']:<15}"
-          )
+          file_label = kernel_name if alloc_idx == 0 else ""
+          table_rows.append([
+              op_label,
+              tensor['name'],
+              tensor['role'],
+              tensor['layout'],
+              tensor['sticks'],
+              tensor['component'],
+              tensor['address'],
+              file_label,
+          ])
 
-        # Add separator line between operations (but not after the last one)
-        if op_idx < len(all_ops) - 1:
-          print("-" * table_width)
-
-    print("=" * table_width)
-
-  # Print statistics
-  print("\nProcessing Statistics:")
-  print("-" * 80)
-  print(f"Total sdsc.json files:           {stats['total_files']}")
-  print(f"Files with operations:           {stats['files_with_ops']}")
-  print(f"Files without operations:        {stats['files_skipped']}")
-
-  if all_ops:
-    print(f"\nOperations Summary:")
-    print(f"  Total operations found:        {len(all_ops)}")
-    print(f"  Unique operation types:        {len(stats['operation_types'])}")
-    for op_type, count in sorted(stats["operation_types"].items()):
-      print(f"    • {op_type:<40}: {count:3d}")
-
-    if stats["component_types"]:
-      print(f"\nMemory Components:")
-      for comp, count in sorted(stats["component_types"].items()):
-        print(f"  {comp:<35}: {count:3d}")
-
-    print(f"\nResource Allocation:")
-    total_cores = sum(op["cores"] for op in all_ops)
-    max_cores = max(op["cores"] for op in all_ops) if all_ops else 0
-    avg_cores = total_cores / len(all_ops) if all_ops else 0
-    print(f"  Total cores allocated:        {total_cores}")
-    print(f"  Max cores per operation:      {max_cores}")
-    print(f"  Avg cores per operation:      {avg_cores:.2f}")
-
-    # Detailed operations breakdown
-    print(f"\nDetailed Operations Breakdown:")
-    print("-" * 80)
-    for op in all_ops:
-      print(f"\n{op['file']} : {op['op_name']} (DSC {op['dsc_idx']})")
-      print(f"  Resources: {op['cores']} cores, {op['corelets']} corelets")
-      if op["component_details"]:
-        print(f"  Components:")
-        for comp in op["component_details"]:
-          print(
-              f"    • {comp['name']} ({comp['type']}, {comp['component']})"
-          )
-      if op["tensors"]:
-        print(f"  Tensors:")
-        for tensor in op["tensors"]:
-          print(
-              f"    • {tensor['name']} ({tensor['role']}): layout=[{tensor['layout']}], "
-              f"sticks=[{tensor['sticks']}] @ {tensor['component']} {tensor['address']}"
-          )
-      if op["dims"]:
-        print(f"  Dimensions: {op['dims']}")
+    headers = ["Op", "Tensor Name", "Role", "Layout", "Sticks", "Component", "Address", "File"]
+    print(tabulate(table_rows, headers=headers, tablefmt="simple_grid"))
   else:
     print("No operations found in any sdsc.json files.")
 
