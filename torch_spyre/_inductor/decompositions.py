@@ -14,6 +14,7 @@
 
 from contextlib import contextmanager
 
+import math
 from typing import Optional, Union, Sequence, Callable, TypeVar
 from typing_extensions import ParamSpec
 import torch
@@ -278,8 +279,12 @@ def register_spyre_decompositions_via_dispatchkey(
                     and getattr(x.device, "type", None) != DEVICE_NAME
                     for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
                 ):
+                    args_device = [
+                        x.device if isinstance(x, torch.Tensor) else None
+                        for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
+                    ]
                     raise RuntimeError(
-                        "Spyre decomposition function called with inputs being on a different device!"
+                        f"Spyre decomposition function called with inputs being on a different device! Args devices: {args_device=}"
                     )
 
                 # Inside a torch.compile context (make_fx tracing, Inductor
@@ -299,11 +304,6 @@ def register_spyre_decompositions_via_dispatchkey(
         return fn
 
     return decomposition_decorator
-
-
-@register_spyre_decomposition([torch.ops.spyre.compact])
-def compact_decomp(x: torch.Tensor) -> torch.Tensor:
-    return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
 
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
@@ -453,16 +453,13 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    # TODO: limitation with mean on dim=-1, transpose for now to avoid
-    # https://github.com/torch-spyre/torch-spyre/issues/632
-    input = input.transpose(-1, -2).contiguous()
     eps_tensor = torch.ops.spyre.full(
         input.shape, eps, dtype=torch.float16, device="spyre"
     )
     rsqrt_inp = (
-        torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+        torch.rsqrt(torch.mean(input * input, dim=-1, keepdim=True)) + eps_tensor
     )
-    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
+    output = input * rsqrt_inp
     if weight is not None:
         output = output * weight
     return output
@@ -512,6 +509,96 @@ def spyre_linear(
     if bias is not None:
         out = out + bias
     return out
+
+
+@register_spyre_decomposition(
+    [torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default]
+)
+def spyre__sdpa_overrideable(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    return_debug_mask: bool = False,
+    scale: float | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    batch_size = query.size(0)
+    num_heads = query.size(1)
+    max_seqlen_q = query.size(2)
+    max_seqlen_kv = key.size(2)
+
+    query = query.clone(memory_format=torch.contiguous_format)
+    key = key.clone(memory_format=torch.contiguous_format)
+    value = value.clone(memory_format=torch.contiguous_format)
+
+    scaling_factor = scale
+    if scaling_factor is None:
+        scaling_factor = 1.0 / math.sqrt(query.shape[-1])
+    scaling_factor = math.sqrt(scaling_factor)
+
+    # TODO (aviros): Figure why this broadcast doesn't work
+    scaling_factor = torch.full_like(query, scaling_factor)
+
+    query = query * scaling_factor
+    key = key * scaling_factor
+
+    key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
+
+    attn = torch.matmul(query, key_t)
+
+    if is_causal:
+        assert attn_bias is None
+        attn_bias = torch.full_like(attn, float("-inf"))
+        attn_bias = attn_bias.triu(diagonal=1)
+
+    if attn_bias is not None:
+        attn = attn + attn_bias
+
+    # TODO (aviros): Switch to _safe_softmax
+    attn = torch.softmax(attn, -1)
+
+    if dropout_p > 0.0:
+        # TODO(aviros): Implement
+        raise Unsupported("Attention dropout not implemented for Spyre")
+
+    # Unused for now
+    logsumexp = torch.empty(
+        (batch_size, num_heads, max_seqlen_q), dtype=torch.float32, device="spyre"
+    )
+    philox_seed = torch.empty((1,), dtype=torch.float16, device="spyre")
+    philox_offset = torch.empty((1,), dtype=torch.float16, device="spyre")
+
+    # B, H, S, E
+    out = torch.matmul(attn, value)
+
+    # B, S, H, E
+    # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
+    out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+
+    # Returns (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
+    return (
+        out.transpose(1, 2),
+        logsumexp,
+        None,
+        None,
+        max_seqlen_q,
+        max_seqlen_kv,
+        philox_seed,
+        philox_offset,
+        None,
+    )
 
 
 ###############################################################################################
