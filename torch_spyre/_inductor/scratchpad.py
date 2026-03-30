@@ -123,7 +123,8 @@ class ScratchPadAllocator:
 
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
-                layout.allocation[f"lx:{idx}"] = addr  # node idx is for debugging
+                # layout.allocation[f"lx:{idx}"] = addr  # node idx is for debugging
+                layout.allocation["lx"] = addr  # assume same addr for same buf, no realloc needed
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {

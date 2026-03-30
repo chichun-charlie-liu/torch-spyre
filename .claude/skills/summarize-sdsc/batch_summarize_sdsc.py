@@ -16,6 +16,7 @@
 """Batch summarize all sdsc.json files from Inductor debug artifacts."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -89,6 +90,16 @@ def _extract_operation_data(op_data: dict) -> dict:
               "component": comp,
           })
 
+  # Extract labeledDs_ to map ldsIdx to memOrg
+  lds_idx_to_mem_org = {}
+  if "labeledDs_" in op_data and isinstance(op_data["labeledDs_"], list):
+    for labeled_ds in op_data["labeledDs_"]:
+      lds_idx = labeled_ds.get("ldsIdx_", -1)
+      mem_org = labeled_ds.get("memOrg_", {})
+      if mem_org:
+        mem_org_str = "/".join(sorted(mem_org.keys()))
+        lds_idx_to_mem_org[lds_idx] = mem_org_str
+
   # Extract allocate nodes indexed by ldsIdx
   allocate_nodes = {}
   if "scheduleTree_" in op_data:
@@ -131,6 +142,7 @@ def _extract_operation_data(op_data: dict) -> dict:
         "sticks": stick_dims,
         "component": alloc_node["component"],
         "address": alloc_node["address"],
+        "mem_org": lds_idx_to_mem_org.get(lds_idx, ""),
     })
 
   # Extract address
@@ -221,8 +233,10 @@ def batch_summarize_directory(base_dir_str: str) -> None:
     print(f"Error: Directory not found: {base_dir_str}", file=sys.stderr)
     sys.exit(1)
 
-  # Find only sdsc.json files
-  sdsc_files = sorted(base_dir.glob("**/sdsc.json"))
+  # Find only sdsc_*.json files (not .out.json variants)
+  sdsc_files = sorted(base_dir.glob("**/sdsc_*.json"))
+  # Filter out .out.json variants
+  sdsc_files = [f for f in sdsc_files if not f.name.endswith(".out.json")]
 
   if not sdsc_files:
     print(f"No sdsc.json files found in {base_dir_str}")
@@ -267,34 +281,65 @@ def batch_summarize_directory(base_dir_str: str) -> None:
     else:
       stats["files_skipped"] += 1
 
-  # Build tensor summary table using tabulate
+  # Print operation summaries first
   if all_ops:
-    print("Tensor Summary Table (One row per tensor allocation):")
+    print("Operations Summary:")
+    print()
+
+    seen_ops = set()
+    for op in all_ops:
+      op_name = op['op_name']
+      if op_name not in seen_ops:
+        seen_ops.add(op_name)
+        tensors_info = []
+        for tensor in op['tensors']:
+          component = tensor['component']
+          role = tensor['role']
+          tensors_info.append(f"{role} ({component})")
+
+        tensors_desc = ", ".join(tensors_info) if tensors_info else "no tensors"
+        print(f"  {op_name:15} — {tensors_desc}")
+
+    print()
+    print("Tensor Summary Table:")
     print()
 
     table_rows = []
     for op_idx, op in enumerate(all_ops):
       op_name = op['op_name']
-      # Extract just the kernel directory name
-      parts = op['file'].split('/')
-      kernel_name = parts[0] if parts else op['file']
+      # Extract parent directory and filename for context, replace hash with <hash>
+      file_path = Path(op['file'])
+      parent_name = file_path.parent.name
+      # Replace the hash part (everything after the last underscore that looks like a hash)
+      import re
+      parent_name = re.sub(r'_(\d+)_.*$', r'_\1_...', parent_name)
+      file_label_text = f"{parent_name}/{file_path.name}"
       if op["tensors"]:
         # Add one row per tensor allocation
         for alloc_idx, tensor in enumerate(op["tensors"]):
           op_label = op_name if alloc_idx == 0 else ""
-          file_label = kernel_name if alloc_idx == 0 else ""
+          file_label = file_label_text if alloc_idx == 0 else ""
+          # Mark stick dimensions with * in the layout
+          layout = tensor['layout']
+          sticks = tensor['sticks']
+          if layout and sticks:
+            stick_dims = set(sticks.split(", "))
+            layout_parts = layout.split(", ")
+            marked_layout = ", ".join(f"{dim}*" if dim in stick_dims else dim for dim in layout_parts)
+          else:
+            marked_layout = layout
           table_rows.append([
               op_label,
               tensor['name'],
               tensor['role'],
-              tensor['layout'],
-              tensor['sticks'],
+              marked_layout,
               tensor['component'],
+              tensor['mem_org'],
               tensor['address'],
               file_label,
           ])
 
-    headers = ["Op", "Tensor Name", "Role", "Layout", "Sticks", "Component", "Address", "File"]
+    headers = ["Op", "Tensor Name", "Role", "Layout*", "Component", "MemOrg", "Address", "File"]
     print(tabulate(table_rows, headers=headers, tablefmt="simple_grid"))
   else:
     print("No operations found in any sdsc.json files.")
@@ -303,8 +348,18 @@ def batch_summarize_directory(base_dir_str: str) -> None:
 
 
 if __name__ == "__main__":
+  # Default to /tmp/torchinductor_* if no path specified
   if len(sys.argv) < 2:
-    print("Usage: batch_summarize_sdsc.py <directory_path>", file=sys.stderr)
-    sys.exit(1)
+    import glob
+    pattern = "/tmp/torchinductor_*"
+    matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if matches:
+      base_dir = matches[0]
+    else:
+      print(f"Error: No torchinductor directories found matching {pattern}", file=sys.stderr)
+      sys.exit(1)
+  else:
+    base_dir = sys.argv[1]
 
-  batch_summarize_directory(sys.argv[1])
+  print(f"Using directory: {base_dir}\n", file=sys.stderr)
+  batch_summarize_directory(base_dir)

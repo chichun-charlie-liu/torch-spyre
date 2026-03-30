@@ -55,8 +55,8 @@ class SpyreAsyncCompile:
             arg_mappings.append(arg_map)
 
         # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
-        kernel_output_dir = get_output_dir(kernel_name)
         if _SDSC_BUNDLE:
+            kernel_output_dir = get_output_dir(kernel_name)
             for idx, sdsc in enumerate(sdscs):
                 with open(
                     os.path.join(kernel_output_dir, f"sdsc_{idx}.json"), "w"
@@ -86,7 +86,7 @@ class SpyreAsyncCompile:
         else:
             # Process each SuperDSC separately
             sdsc_dirs = []
-            for sdsc in enumerate(sdscs):
+            for sdsc in sdscs:
                 kernel_output_dir = get_output_dir(kernel_name)
                 subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
                 os.makedirs(subdir, exist_ok=True)
