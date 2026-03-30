@@ -267,8 +267,8 @@ def try_insert_clone_nodes_for_inputs(
     scheduler = V.graph.scheduler
     fx_graph = V.graph.graph
 
-    buf_read_counts = {}
-    buf_users = {}
+    buf_read_counts: dict[str, int] = {}
+    buf_users: dict[str, SchedulerNode] = {}
     for n in nodes:
         reads = n.get_read_write_buffer_accesses(
             include_reads=True, include_writes=False
@@ -303,7 +303,7 @@ def try_insert_clone_nodes_for_inputs(
         # step 2: Use the new FX node -> new TensorBox -> new SchedulerNode
         # NOTE .run_node(n) needs a {fx nodes: TensorBox} mapping for each elem in n.args
         # e.g. new_fx_node.args=(arg0, ), env[arg0_1] -> point to arg0_1's TensorBox
-        env = {}
+        env: dict = {}
         for tbs in graph_lowering.name_to_users.values():
             for tb in tbs:
                 tb_fx_node = list(tb.data.origins)[0]
