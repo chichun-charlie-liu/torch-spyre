@@ -110,7 +110,9 @@ class ScratchPadAllocator:
             addr = -1
             tensor_on_lx = self.usage.get(tensor_name, {})
             size_match = tensor_on_lx.get("size", 0) == needed["size"]
-            allowed_output_op = any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+            allowed_output_op = any(
+                op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
+            )
 
             if needed["is_input"] and tensor_on_lx and size_match:
                 addr = self.usage[tensor_name]["addr"]
@@ -123,8 +125,8 @@ class ScratchPadAllocator:
 
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
-                # layout.allocation[f"lx:{idx}"] = addr  # node idx is for debugging
-                layout.allocation["lx"] = addr  # assume same addr for same buf, no realloc needed
+                layout.allocation["lx"] = addr
+                # NOTE assume same addr for same buf, no realloc needed/allowed
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {
@@ -213,7 +215,8 @@ class NameSwapHandler(WrapperHandler):
 
 
 def create_Loop_hack_inner_fn(old_Loop, name_map):
-    """ Use ops_handler to swap the name of buffers"""
+    """Use ops_handler to swap the name of buffers"""
+
     def new_inner_fn(*args):
         # Pointwise has 1 pos arg index while Reduction has 2, i.e. (index, rindex)
         with V.set_ops_handler(NameSwapHandler(V.ops, name_map)):
@@ -222,7 +225,7 @@ def create_Loop_hack_inner_fn(old_Loop, name_map):
     # old_Loop could be a Pointwise or Reduction.
     kwargs = {k: getattr(old_Loop, k) for k in old_Loop.__dataclass_fields__.keys()}
     kwargs["inner_fn"] = new_inner_fn
-    new_Loop = old_Loop.__class__(**kwargs) 
+    new_Loop = old_Loop.__class__(**kwargs)
     # Additional attr that are not included in dataclass_fields. NOTE it relies on a
     # special method to force reset attrs of a frozen dataclass, see ir.Loops.create()
     new_Loop._post_init_setattr("origins", old_Loop.origins)
@@ -253,7 +256,7 @@ def try_insert_clone_nodes_for_inputs(
         new CompBuf -> new LoopIR. But in case corresponding FX node has defect to begin
         with, we chose to hack the inner_fn then build a new LoopIR from there.
     NOTE:
-    - ONCE WE correctly updated args in "node.data(i.e. a LoopIR).inner_fn", 
+    - ONCE WE correctly updated args in "node.data(i.e. a LoopIR).inner_fn",
       node.read_writes and node._body can be refreshed by calling node.recompute_body().
       But need to make sure to clear cached body first.
     - check Scheduler._replace_node() and fuse_nodes_once() for hints of important items
@@ -273,10 +276,10 @@ def try_insert_clone_nodes_for_inputs(
         for b in reads.keys():
             buf_read_counts[b] = buf_read_counts.get(b, 0) + 1
             buf_users[b] = buf_users.get(b, [])
-            buf_users[b].append(n)  # TODO a node cannot read the same buf twice? no need to dedup?
+            buf_users[b].append(n)
+            # TODO a node cannot read the same buf twice? no need to dedup?
 
     for inp_name in V.graph.graph_input_names:
-
         # Step 0: check how many times this buffer will be read, decide cloning or not
         buf = V.graph.get_buffer(inp_name)
         dev_layout = buf.layout.device_layout
@@ -287,7 +290,7 @@ def try_insert_clone_nodes_for_inputs(
 
         # step 1: create a new FX node on FX graph and then refresh dependencies
         fx_inp = list(buf.origins)[0]
-        old_users = list(fx_inp.users.keys())    # get old users before insertion
+        old_users = list(fx_inp.users.keys())  # get old users before insertion
         fx_graph.inserting_after(fx_inp)
         new_fx_node = fx_graph.create_node(
             "call_function", ops.aten.clone.default, (fx_inp,)
@@ -350,7 +353,7 @@ def try_insert_clone_nodes_for_inputs(
         scheduler.nodes = nodes
         # scheduler.nodes = scheduler.topological_sort_schedule(scheduler.nodes)
         # scheduler.prune_redundant_deps(scheduler.nodes)
-        scheduler.name_to_node = {n.get_name():n for n in scheduler.nodes}
+        scheduler.name_to_node = {n.get_name(): n for n in scheduler.nodes}
         scheduler.name_to_fused_node = scheduler.name_to_node
         scheduler.name_to_buf.update(new_sch_node.outputs_by_name)
         lx_free_total -= dev_size
