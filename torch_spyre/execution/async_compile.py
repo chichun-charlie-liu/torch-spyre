@@ -55,6 +55,7 @@ class SpyreAsyncCompile:
             arg_mappings.append(arg_map)
 
         # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
+        kernel_output_dir = get_output_dir(kernel_name)
         if _SDSC_BUNDLE:
             for idx, sdsc_json in enumerate(sdscs_json):
                 with open(
