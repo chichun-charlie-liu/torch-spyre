@@ -40,8 +40,6 @@ test_suite_config:
                 - name: int8
                 - name: uint8
         - names: # Tests that pass for float16 but fail for int64
-            - TestViewOps::test_view_dtype_upsize_errors # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
-            - TestViewOps::test_view_tensor_split   # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
             - TestOldViewOps::test_transposes_errors   # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
           mode: mandatory_success
           edits:
@@ -51,8 +49,7 @@ test_suite_config:
         - names: # Tests that fail 
             - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
             - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
-            - TestViewOps::test_conj_view_with_shared_memory   # RuntimeError: Spyre backend does not support dtype ComplexFloat https://github.com/torch-spyre/torch-spyre/issues/678
-            - TestViewOps::test_flatten_view   # torch._inductor.exc.InductorError: CalledProcessError 'dxp_standalone' (not implemented yet) https://github.com/torch-spyre/torch-spyre/issues/903
+            - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             - TestViewOps::test_unfold_view   # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
             - TestViewOps::test_T_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             - TestViewOps::test_as_strided_inplace_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
