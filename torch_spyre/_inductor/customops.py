@@ -205,3 +205,17 @@ def _ones_scalar_fake(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(1, dtype=dtype, device="spyre")
+
+
+# Copy input into output starting at offset along dimension dim and
+# return the updated output.
+@torch.library.custom_op("spyre::overwrite", mutates_args=(), device_types="spyre")
+def overwrite(
+    input: torch.Tensor, output: torch.Tensor, dim: int, offset: int
+) -> torch.Tensor:
+    pass
+
+
+@overwrite.register_fake
+def _(input: torch.Tensor, output: torch.Tensor, dim: int, offset: int) -> torch.Tensor:
+    return output

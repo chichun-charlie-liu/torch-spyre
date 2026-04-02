@@ -453,12 +453,9 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    eps_tensor = torch.ops.spyre.full(
-        input.shape, eps, dtype=torch.float16, device="spyre"
-    )
-    rsqrt_inp = (
-        torch.rsqrt(torch.mean(input * input, dim=-1, keepdim=True)) + eps_tensor
-    )
+    mean = torch.mean(input * input, dim=-1, keepdim=True)
+    eps_tensor = torch.ops.spyre.full((1,), eps, dtype=torch.float16, device="spyre")
+    rsqrt_inp = torch.rsqrt(mean + eps_tensor)
     output = input * rsqrt_inp
     if weight is not None:
         output = output * weight
@@ -549,10 +546,11 @@ def spyre__sdpa_overrideable(
     scaling_factor = math.sqrt(scaling_factor)
 
     # TODO (aviros): Figure why this broadcast doesn't work
-    scaling_factor = torch.full_like(query, scaling_factor)
+    scaling_factor_q = torch.full_like(query, scaling_factor)
+    scaling_factor_k = torch.full_like(key, scaling_factor)
 
-    query = query * scaling_factor
-    key = key * scaling_factor
+    query = query * scaling_factor_q
+    key = key * scaling_factor_k
 
     key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
@@ -599,6 +597,30 @@ def spyre__sdpa_overrideable(
         philox_offset,
         None,
     )
+
+
+@register_spyre_decomposition([torch.ops.aten.cat.default])
+def decompose_cat(
+    tensors: list[torch.Tensor],
+    dim: int = 0,
+) -> torch.Tensor:
+    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
+    if orig_decomp == NotImplemented:
+        expanded_size = 0
+        for t in tensors:
+            expanded_size += t.size(dim)
+        output_size = list(tensors[0].size())
+        output_size[dim] = expanded_size
+        output = tensors[0].new_empty(output_size)
+        offset = 0
+        for input in tensors:
+            output = torch.ops.spyre.overwrite(
+                input=input, output=output, dim=dim, offset=offset
+            )
+            offset += input.size(dim)
+        return output
+    else:
+        return orig_decomp
 
 
 ###############################################################################################

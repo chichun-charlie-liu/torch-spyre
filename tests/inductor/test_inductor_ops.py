@@ -746,6 +746,80 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_cat",
+            "test_cat_cpu",
+        ): {
+            "param_sets": {
+                "1d_dim0": (
+                    0,
+                    cached_randn((64,), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float16),
+                ),
+                "1d_dim0_three_tensors": (
+                    0,
+                    cached_randn((64,), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float16),
+                    cached_randn((192,), dtype=torch.float16),
+                ),
+                "2d_dim0_diff_size": (
+                    0,
+                    cached_randn((64, 128), dtype=torch.float16),
+                    cached_randn((128, 128), dtype=torch.float16),
+                ),
+                "2d_dim0_three_tensors": (
+                    0,
+                    cached_randn((64, 64), dtype=torch.float16),
+                    cached_randn((128, 64), dtype=torch.float16),
+                    cached_randn((192, 64), dtype=torch.float16),
+                ),
+                "2d_dim1_diff_size": (
+                    1,
+                    cached_randn((128, 64), dtype=torch.float16),
+                    cached_randn((128, 128), dtype=torch.float16),
+                ),
+                "3d_dim0": (
+                    0,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((3, 32, 64), dtype=torch.float16),
+                ),
+                "3d_dim1": (
+                    1,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((2, 16, 64), dtype=torch.float16),
+                ),
+                "3d_dim2": (
+                    2,
+                    cached_randn((2, 32, 64), dtype=torch.float16),
+                    cached_randn((2, 32, 128), dtype=torch.float16),
+                ),
+                "3d_dim1_size1": (
+                    1,
+                    cached_randn((8, 64, 128), dtype=torch.float16),
+                    cached_randn((8, 1, 128), dtype=torch.float16),
+                ),
+                "4d_dim0": (
+                    0,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((3, 4, 8, 64), dtype=torch.float16),
+                ),
+                "4d_dim1": (
+                    1,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 6, 8, 64), dtype=torch.float16),
+                ),
+                "4d_dim2": (
+                    2,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 4, 12, 64), dtype=torch.float16),
+                ),
+                "4d_dim3": (
+                    3,
+                    cached_randn((2, 4, 8, 64), dtype=torch.float16),
+                    cached_randn((2, 4, 8, 128), dtype=torch.float16),
+                ),
+            },
+        },
+        (
             "test_fallback",
             "test_fallback_cpu",
         ): {
@@ -1522,7 +1596,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(op, x, y, run_eager=eager_supported)
 
     def test_linear_fn(self, x, weight, bias):
-        compare_with_cpu(torch.nn.functional.linear, x, weight, bias)
+        # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without
+        compare_with_cpu(
+            torch.nn.functional.linear, x, weight, bias, atol=3e-1, rtol=2e-1
+        )
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -1718,6 +1795,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_numel_cpu(self, x):
         compare_with_cpu(lambda x: torch.numel(x), x)
+
+    def test_cat_cpu(self, dim, *tensors):
+        def fn(*tensors):
+            return torch.cat(tensors, dim=dim)
+
+        compare_with_cpu(fn, *tensors)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):

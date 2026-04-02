@@ -64,24 +64,18 @@ class TensorDep:
         self.device_coords = device_coordinates(self.layout, self.dep)
 
 
-def core_split(size: int, max_cores: int, min_slice: int = 1) -> int:
+def core_split(size: int, max_cores: int) -> int:
     """
-    Find the largest divisor of size that doesn't exceed max_cores,
-    such that the resulting slice size (size // divisor) is a multiple
-    of min_slice.
-
+    Find the largest divisor of size that doesn't exceed max_cores.
     Args:
         size: The dimension size to split
         max_cores: Maximum number of cores to use for this dimension
-        min_slice: Each core's slice must be a multiple of this value
-                   (e.g. stick size for clone ops)
 
     Returns:
-        Number of cores to use (always divides size evenly and leaves
-        each core with a slice that is a multiple of min_slice)
+        Number of cores to use (always divides size evenly)
     """
     for i in range(max_cores, 0, -1):
-        if size % i == 0 and (size // i) % min_slice == 0:
+        if size % i == 0:
             return i
     return 1
 
@@ -91,7 +85,6 @@ def multi_dim_iteration_space_split(
     max_cores: int,
     priorities: list[Symbol],
     min_splits: dict[Symbol, int] | None = None,
-    min_slice: int = 1,
 ) -> dict[Symbol, int]:
     """
     Distribute max_cores across multiple dimensions of an iteration space.
@@ -106,8 +99,6 @@ def multi_dim_iteration_space_split(
         max_cores: Total number of cores available
         priorities: Order in which to consider the dimensions
         min_splits: Minimum splits required for each dimension (optional)
-        min_slice: Each core's slice must be a multiple of this value
-                   (e.g. stick size for clone ops)
 
     Returns:
         The core splits for the iteration_space
@@ -119,6 +110,8 @@ def multi_dim_iteration_space_split(
     # First pass: satisfy minimum split requirements
     if min_splits:
         for var, min_split in min_splits.items():
+            assert var not in priorities  # there shouldn't be an overlap
+
             # Check if we have enough cores for this minimum split
             if n_cores_remaining // min_split <= 0:
                 logger.critical(
@@ -136,10 +129,8 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        if min_splits and v in min_splits:
-            continue  # Already handled in first pass
 
-        best_split = core_split(iteration_space[v], n_cores_remaining, min_slice)
+        best_split = core_split(iteration_space[v], n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
@@ -173,6 +164,9 @@ def adjust_it_space_for_sticks(
                 f"Mixed-dtype tensors sharing a stick variable are not supported."
             )
             continue
+        # FIXME: here we assume padding to a full stick. It may not always be the
+        #        case and we shouldn use a more robust way of computing the number
+        #        of sticks
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
@@ -239,6 +233,7 @@ def prioritize_dimensions(
     output: TensorDep,
     it_space: dict[Symbol, Expr],
     inputs: list[TensorDep] | None = None,
+    exclude_reduction: bool = False,
 ) -> tuple[list[Symbol], dict[Symbol, int]]:
     """
     Return iteration variables in priority order for core division, along with
@@ -259,25 +254,28 @@ def prioritize_dimensions(
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     all_deps = (inputs + [output]) if inputs is not None else [output]
+    # NOTE: it is possible that a reduction var is selected as must split
     min_splits = must_split_vars(all_deps, it_space)
-    priority = list(min_splits.keys())
 
+    priority = []
     remaining_output = []
     reduction_dims: list[tuple[Symbol, Expr]] = []
     for s, e in it_space.items():
         if s in min_splits:
+            assert not exclude_reduction or s in coord_vars, (
+                f"Excluding reduction dimensions but {s} must be split"
+            )
             continue
         if s in coord_vars:
             remaining_output.append((s, e))
         else:
-            # NOTE: skip reduction dims for now for known backend bug
-            # reduction_dims.append((s, e))
-            pass
+            reduction_dims.append((s, e))
 
     remaining_output.sort(key=lambda t: t[1], reverse=True)
     reduction_dims.sort(key=lambda t: t[1], reverse=True)
     priority += [t[0] for t in remaining_output]
-    priority += [t[0] for t in reduction_dims]
+    if not exclude_reduction:
+        priority += [t[0] for t in reduction_dims]
 
     return priority, min_splits
 
@@ -287,20 +285,17 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     it_space = iteration_space(n)
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
-    adjust_it_space_for_sticks(it_space, [output_td])
-    origin_node = next(iter(n.node.data.origins))
-    is_clone = origin_node is not None and origin_node.target == aten.clone.default
+    adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    elems_per_stick = output_td.layout.device_layout.elems_per_stick()
     priorities, min_splits = prioritize_dimensions(output_td, it_space)
     splits = multi_dim_iteration_space_split(
         it_space,
         max_cores,
         priorities,
         min_splits,
-        min_slice=elems_per_stick if is_clone else 1,
     )
 
     cores_used = math.prod(splits.values())
@@ -321,8 +316,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     red: Reduction = n.node.data
-    if red.reduction_type not in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
-        return
+    is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
     it_space = iteration_space(n)
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
@@ -331,7 +325,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
+    # FIXME: For non-matmul reduction, excluting reduction dimensions from work
+    #        division candidates temporarily till known backend issue is fixed
+    #        https://github.com/torch-spyre/torch-spyre/issues/1304
+    priorities, min_splits = prioritize_dimensions(
+        output_td, it_space, input_tds, exclude_reduction=not is_matmul
+    )
     splits = multi_dim_iteration_space_split(
         it_space, max_cores, priorities, min_splits
     )

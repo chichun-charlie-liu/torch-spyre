@@ -84,6 +84,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     output.device, output.dtype, output.size, output.stride, stl
                 )
 
+            case spyreop.overwrite.default:
+                stl = SpyreTensorLayout(output.size, output.dtype)
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case _:
                 x_stl = x.layout.device_layout
                 in_coords = host_coordinates(x.layout, x.dep)

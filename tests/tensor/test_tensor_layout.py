@@ -19,11 +19,7 @@ import pickle
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import (
-    SpyreTensorLayout,
-    to_with_layout,
-    get_device_dtype,
-)
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -111,26 +107,26 @@ class TestSpyreTensorLayout(TestCase):
     def test_to_spyre_layout(self):
         x = torch.rand([512, 256], dtype=torch.float16)
         x_stl = SpyreTensorLayout([512, 256], torch.float16)
-        x_dev = to_with_layout(x, x_stl)
+        x_dev = x.to(device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
 
         y = torch.rand([512, 512], dtype=torch.float16)
         y_stl = SpyreTensorLayout(
             [8, 512, 64], [1, 0, 1], [64, 512, 1], get_device_dtype(torch.float16)
         )
-        y_dev = to_with_layout(y, y_stl)
+        y_dev = y.to(device_layout=y_stl)
         self.assertEqual(y, y_dev.cpu())
 
         z = torch.rand([512, 8, 256], dtype=torch.float16)
         z_stl = SpyreTensorLayout(
             [512, 8, 256], [4096, 256, 1], torch.float16, [2, 1, 0]
         )
-        z_dev = to_with_layout(z, z_stl)
+        z_dev = z.to(device_layout=z_stl)
         self.assertEqual(z_dev, z_dev.cpu())
 
         w = torch.rand([512, 256], dtype=torch.float16)
         w_stl = SpyreTensorLayout([512, 256], [4096, 256, 1], torch.float16, [0, 1, -1])
-        w_dev = to_with_layout(w, w_stl)
+        w_dev = w.to(device_layout=w_stl)
         self.assertEqual(w, w_dev.cpu())
 
     def test_to_layout_patched(self):
@@ -167,8 +163,8 @@ class TestSpyreTensorLayout(TestCase):
         x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
         y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [0, 1, 2])
         _ = x.to("spyre")  # required for lazy device initialization
-        x_dev = to_with_layout(x, x_stl)
-        y_dev = to_with_layout(y, y_stl)
+        x_dev = x.to(device_layout=x_stl)
+        y_dev = y.to(device_layout=y_stl)
         compiled = torch.compile(torch.add)
         compiled_result = compiled(x_dev, y_dev).cpu()
         torch.testing.assert_close(
@@ -187,8 +183,8 @@ class TestSpyreTensorLayout(TestCase):
         x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
         y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [2, 1, 0])
         _ = x.to("spyre")  # required for lazy device initialization
-        x_dev = to_with_layout(x, x_stl)
-        y_dev = to_with_layout(y, y_stl)
+        x_dev = x.to(device_layout=x_stl)
+        y_dev = y.to(device_layout=y_stl)
         compiled = torch.compile(torch.add)
         with self.assertRaises(RuntimeError) as context:
             _ = compiled(x_dev, y_dev).cpu()

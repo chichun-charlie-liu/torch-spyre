@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
+import math
 
 import torch
 import sympy
@@ -158,6 +159,17 @@ class SpyreOpFuncs:
     @staticmethod
     def neg(a):
         return PointwiseOp("neg", [a])
+
+    @staticmethod
+    def overwrite(input, stride, offset, gap):
+        op_info = {
+            "overwrite_info": {
+                "stride": stride,
+                "offset": offset,
+                "gap": gap,
+            }
+        }
+        return PointwiseOp("overwrite", [input], op_info)
 
     @staticmethod
     def reciprocal(x):
@@ -318,7 +330,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             tensor.layout.allocation,
         )
-        self.spyre_kernel_args.append((name, tensor_arg))
+        if not tensor.layout.allocation:
+            self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
     def create_op_spec(
@@ -355,17 +368,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def remove_kernel_local_buffers(self) -> None:
-        """Do not remove kernel local buffers becasue we need the allocate in hbm/lx"""
-        pass
+        """Remove buffers that have a scratchpad allocation from the kernel's arg list."""
+        for name in list(self.store_buffer_names):
+            buf = V.graph.get_buffer(name)
+            if buf is None:
+                continue
+            layout = buf.get_layout()
+            if isinstance(layout, FixedTiledLayout) and layout.allocation:
+                self.remove_buffer(name)
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
-        _ = self.args.input(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        if not layout.allocation:
+            _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -413,6 +433,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
+            if value.op == "overwrite":
+                convert_overwrite(
+                    value.op_info["overwrite_info"], dst.layout.device_layout
+                )
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
@@ -592,3 +616,18 @@ def simplify_op_spec(op_spec):
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
+
+
+def convert_overwrite(overwrite_info, stl):
+    stride = overwrite_info["stride"]
+    gap = overwrite_info["gap"]
+    offset = overwrite_info["offset"]
+    span = gap * stride
+    device_dim = None
+    max_stride = 0
+    for i, st in enumerate(stl.stride_map):
+        if st > max_stride and span >= st and stl.device_size[i] > 1:
+            max_stride = st
+            device_dim = i
+    overwrite_info["device_stride"] = math.prod(stl.device_size[device_dim + 1 :])
+    overwrite_info["device_offset"] = offset * stride // max_stride
