@@ -337,7 +337,7 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=addr,
+                start_address=addr if not arg.allocation else arg.allocation["lx"],
                 backGap=backGap if not arg.is_input else {},
                 offset=output_offset if not arg.is_input else 0,
             )
