@@ -338,7 +338,7 @@ def try_insert_clone_nodes_for_inputs(
                 buf.layout.dtype,
                 buf.layout.size,
                 buf.layout.stride,
-                buf.layout.device_layout
+                buf.layout.device_layout,
             ),
             data=clone_IR_tb.data.data,
         )

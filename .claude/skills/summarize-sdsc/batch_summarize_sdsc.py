@@ -254,7 +254,7 @@ def batch_summarize_directory(base_dir_str: str) -> None:
         print(f"No sdsc.json files found in {base_dir_str}")
         return
 
-    print(f"\nSDSC Operations Summary - Batch Report")
+    print("\nSDSC Operations Summary - Batch Report")
     print(f"Directory: {base_dir}")
     print(f"Total sdsc.json files found: {len(sdsc_files)}\n")
 
