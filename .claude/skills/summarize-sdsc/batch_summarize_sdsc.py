@@ -254,11 +254,9 @@ def batch_summarize_directory(base_dir_str: str) -> None:
         print(f"No sdsc.json files found in {base_dir_str}")
         return
 
-    print(f"\n{'=' * 200}")
-    print("SDSC Operations Summary - Batch Report")
+    print(f"\nSDSC Operations Summary - Batch Report")
     print(f"Directory: {base_dir}")
-    print(f"Total sdsc.json files found: {len(sdsc_files)}")
-    print(f"{'=' * 200}\n")
+    print(f"Total sdsc.json files found: {len(sdsc_files)}\n")
 
     # Collect all operations data
     all_ops = []
@@ -295,8 +293,7 @@ def batch_summarize_directory(base_dir_str: str) -> None:
 
     # Print operation summaries first
     if all_ops:
-        print("Operations Summary:")
-        print()
+        print("Operations Summary:\n")
 
         seen_ops = set()
         for op in all_ops:
@@ -312,21 +309,14 @@ def batch_summarize_directory(base_dir_str: str) -> None:
                 tensors_desc = ", ".join(tensors_info) if tensors_info else "no tensors"
                 print(f"  {op_name:15} — {tensors_desc}")
 
-        print()
-        print("Tensor Summary Table:")
-        print()
+        print("\nTensor Summary Table:\n")
 
         table_rows = []
         for op_idx, op in enumerate(all_ops):
             op_name = op["op_name"]
-            # Extract parent directory and filename for context, replace hash with <hash>
+            # Extract just the sdsc*.json filename
             file_path = Path(op["file"])
-            parent_name = file_path.parent.name
-            # Replace the hash part (everything after the last underscore that looks like a hash)
-            import re
-
-            parent_name = re.sub(r"_(\d+)_.*$", r"_\1_...", parent_name)
-            file_label_text = f"{parent_name}/{file_path.name}"
+            file_label_text = file_path.name
             if op["tensors"]:
                 # Add one row per tensor allocation
                 for alloc_idx, tensor in enumerate(op["tensors"]):
@@ -368,11 +358,10 @@ def batch_summarize_directory(base_dir_str: str) -> None:
             "Address",
             "File",
         ]
-        print(tabulate(table_rows, headers=headers, tablefmt="simple_grid"))
+        table_output = tabulate(table_rows, headers=headers, tablefmt="simple_grid")
+        print(table_output)
     else:
-        print("No operations found in any sdsc.json files.")
-
-    print()
+        print("No operations found in any sdsc.json files.\n")
 
 
 if __name__ == "__main__":

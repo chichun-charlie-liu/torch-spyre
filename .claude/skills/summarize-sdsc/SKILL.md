@@ -20,11 +20,14 @@ Analyzes all `sdsc.json` files in a directory and generates a comprehensive summ
 /summarize-sdsc [optional_directory_path]
 ```
 
-**Default behavior:** If no path is provided, automatically uses the most recent `/tmp/torchinductor_<username>/` directory (where PyTorch Inductor writes debug artifacts).
+**Default behavior (no arguments):** Automatically analyzes the most recent `/tmp/torchinductor_<username>/` directory where PyTorch Inductor writes debug artifacts. Returns a complete summary without prompts.
 
-**Custom path:** Pass an optional directory path to analyze a specific location containing `sdsc_*` subdirectories.
+**Custom directory:** Optionally provide a directory path to analyze a specific location containing `sdsc_*` subdirectories:
+```
+/summarize-sdsc /path/to/custom/directory
+```
 
-**File matching:** Automatically searches for all `sdsc.json` files within the specified directory and its subdirectories.
+**File discovery:** Automatically searches for all `sdsc_*.json` files (excluding `.out.json` variants) within the directory and its subdirectories.
 
 ## Output
 

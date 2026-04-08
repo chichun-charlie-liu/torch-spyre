@@ -27,6 +27,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 from torch import ops
 from .logging_utils import get_inductor_logger
+from .ir import FixedTiledLayout
 from . import config
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
@@ -105,9 +106,11 @@ class ScratchPadAllocator:
         """
         graph_output_buf_name = V.graph.get_output_names()
         for tensor_name, needed in mem_usage.items():
+            is_graph_input = tensor_name not in V.graph.name_to_buffer
             is_graph_output = tensor_name in graph_output_buf_name
             core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
-            if is_graph_output or core_div_mismatch:
+            if is_graph_input or is_graph_output or core_div_mismatch:
+                # graph input itself cannot be pin, but we may be able to clone
                 # graph output has to go back to HBM
                 # if buf users have diff core-splits -> cause cross-core LX read/write
                 continue
@@ -207,6 +210,7 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
     buf_read_counts: dict[str, int] = {}
     buf_write_counts: dict[str, int] = {}
     buf_users: dict[str, SchedulerNode] = {}
+    buf_users_read_and_write: dict[str, SchedulerNode] = {}
     core_div_mismatch: dict[str, bool] = {}
 
     for idx, n in enumerate(nodes):
@@ -220,6 +224,7 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
                 buf_users[buf] = buf_users.get(buf, []) + [n]
             else:
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
+            buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [n]
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -235,14 +240,14 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
     #       buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> next op
     #       has to read from 2 different scratchpads...
     # TODO looking for options to broadcast to or all_reduce from multiple scratchpad
-    using_multicore = int(os.environ.get("SENCORES", "32")) > 1
-    for n in nodes:
+    using_multicore = config.sencores > 1
+    for buf_name, users_rw in buf_users_read_and_write.items():
+        # this dict includes graph input and output
         same_core_div = True
-        buf_name = n.node.name
-        if using_multicore:
-            n_split = n.op_it_space_splits
-            users = buf_users.get(buf_name, [])  # if no user => graph output
-            same_core_div = all(n_split == u.op_it_space_splits for u in users)
+        if using_multicore and len(users_rw) > 1:
+            # >1 check is for graph output
+            u0_split = users_rw[0].op_it_space_splits
+            same_core_div = all(u0_split == u.op_it_space_splits for u in users_rw[1:])
         core_div_mismatch[buf_name] = not same_core_div
 
     return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
@@ -328,7 +333,13 @@ def try_insert_clone_nodes_for_inputs(
         clone_IR_tb = clone_lowering(buf)  # a TensorBox wrapping a PointwiseIR
         com_buf = ComputedBuffer(
             name=None,
-            layout=buf.layout,
+            layout=FixedTiledLayout(
+                buf.layout.device,
+                buf.layout.dtype,
+                buf.layout.size,
+                buf.layout.stride,
+                buf.layout.device_layout
+            ),
             data=clone_IR_tb.data.data,
         )
         # create a "dangling" FX node, just to store meta data
@@ -394,17 +405,16 @@ def scratchpad_planning(
 
     idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
 
-    # TODO disable node insertion for now due to unresolved backend issue
-    # num_nodes_before = len(nodes)
-    # nodes = try_insert_clone_nodes_for_inputs(
-    #     nodes,
-    #     alloc.get_available_total(),
-    #     buf_users,
-    #     core_div_mismatch,
-    # )
+    num_nodes_before = len(nodes)
+    nodes = try_insert_clone_nodes_for_inputs(
+        nodes,
+        alloc.get_available_total(),
+        buf_users,
+        core_div_mismatch,
+    )
 
-    # if len(nodes) > num_nodes_before:
-    #     idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
+    if len(nodes) > num_nodes_before:
+        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
 
     for idx, n in enumerate(nodes):
         # release unneeded LX allocations before actual planning
