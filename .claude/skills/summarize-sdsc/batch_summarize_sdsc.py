@@ -331,6 +331,7 @@ def batch_summarize_directory(base_dir_str: str) -> None:
                 # Add one row per tensor allocation
                 for alloc_idx, tensor in enumerate(op["tensors"]):
                     op_label = op_name if alloc_idx == 0 else ""
+                    cores_label = str(op["cores"]) if alloc_idx == 0 else ""
                     file_label = file_label_text if alloc_idx == 0 else ""
                     # Mark stick dimensions with * in the layout
                     layout = tensor["layout"]
@@ -347,11 +348,11 @@ def batch_summarize_directory(base_dir_str: str) -> None:
                     table_rows.append(
                         [
                             op_label,
+                            cores_label,
                             tensor["name"],
                             tensor["role"],
                             marked_layout,
                             tensor["component"],
-                            tensor["mem_org"],
                             tensor["address"],
                             file_label,
                         ]
@@ -359,11 +360,11 @@ def batch_summarize_directory(base_dir_str: str) -> None:
 
         headers = [
             "Op",
+            "Cores",
             "Tensor Name",
             "Role",
             "Layout*",
             "Component",
-            "MemOrg",
             "Address",
             "File",
         ]

@@ -17,6 +17,7 @@ import os
 from torch._inductor.ir import (
     ComputedBuffer,
 )
+from torch._inductor.lowering import clone as clone_lowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
@@ -25,13 +26,15 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.virtualized import V
 from torch import ops
-from .stickify import propagate_spyre_tensor_layouts
+from .logging_utils import get_inductor_logger
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
     "sum",
     "clone",
 ]
+
+logger = get_inductor_logger("LX_PLANNING")
 
 
 class ScratchPadAllocator:
@@ -103,8 +106,12 @@ class ScratchPadAllocator:
         """
         graph_output_buf_name = V.graph.get_output_names()
         for tensor_name, needed in mem_usage.items():
-            if tensor_name in graph_output_buf_name:
-                continue  # graph output has to go back to HBM
+            is_graph_output = tensor_name in graph_output_buf_name
+            core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
+            if is_graph_output or core_div_mismatch:
+                # graph output has to go back to HBM
+                # if buf users have diff core-splits -> cause cross-core LX read/write
+                continue
 
             # Decide whether to reuse.
             addr = -1
@@ -172,9 +179,13 @@ def consider_for_scratchpad(
     n: SchedulerNode,
     alloc: ScratchPadAllocator,
     idx: int,
+    core_div_mismatch: dict[str, bool] = {},
 ):
     # 1. summarize both inputs and output sizes used by this node.
     mem_usage = mem_usage_by_node(n)
+    for buf in mem_usage:
+        mem_usage[buf]["core_div_mismatch"] = core_div_mismatch.get(buf, False)
+        # if a buf is not in core_div_mismatch => it has no users => graph output
 
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
@@ -182,17 +193,28 @@ def consider_for_scratchpad(
     alloc.try_allocate(mem_usage, idx, org_op_name)
 
 
-def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
+def buf_analysis(nodes: list[BaseSchedulerNode]):
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
     Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
     """
     last_used: dict = {}
-    occurence: dict = {}
+    buf_read_counts: dict[str, int] = {}
+    buf_write_counts: dict[str, int] = {}
+    buf_users: dict[str, SchedulerNode] = {}
+    core_div_mismatch: dict[str, bool] = {}
+
     for idx, n in enumerate(nodes):
+        buf_read_by_n = n.get_read_write_buffer_accesses(
+            include_reads=True, include_writes=False
+        )  # its {"buf_name": bytes read, ...}
         for buf in n.used_buffer_names():  # just buf names
             last_used[buf] = idx
-            occurence[buf] = occurence.get(buf, 0) + 1
+            if buf in buf_read_by_n:
+                buf_read_counts[buf] = buf_read_counts.get(buf, 0) + 1
+                buf_users[buf] = buf_users.get(buf,[]) + [n]
+            else:
+                buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -202,7 +224,23 @@ def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
         else:
             bufs_to_dealloc_at_idx[idx + 1] = [buf]
 
-    return bufs_to_dealloc_at_idx
+    # Check core-division -> If the node generating the buffer and any of the nodes
+    # consuming this buffer have different core division => do not pin this buffer to LX 
+    # NOTE Because each core can only write to its own scratchpad. For example, if a
+    #       buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> next op
+    #       has to read from 2 different scratchpads...
+    # TODO looking for options to broadcast to or all_reduce from multiple scratchpad
+    using_multicore = int(os.environ.get("SENCORES", "32")) > 1
+    for n in nodes:
+        same_core_div = True
+        buf_name = n.node.name
+        if using_multicore:
+            n_split = n.op_it_space_splits
+            users = buf_users.get(buf_name, [])  # if no user => graph output
+            same_core_div = all(n_split == u.op_it_space_splits for u in users)
+        core_div_mismatch[buf_name] = not same_core_div
+
+    return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
 
 
 class NameSwapHandler(WrapperHandler):
@@ -240,25 +278,23 @@ def create_Loop_hack_inner_fn(old_Loop, name_map):
 def try_insert_clone_nodes_for_inputs(
     nodes: list[BaseSchedulerNode],
     lx_free_total: int,
+    buf_users: dict[str, SchedulerNode],
+    core_div_mismatch: dict[str, bool],
 ) -> list[BaseSchedulerNode]:
     """
     Check if any input tensors can fit onto scratchpad and needed more than once =>
     Add corresponding "clone" node to copy it to scratchpad and reduce reading from HBM.
 
-    During the lowering process, FX nodes are interpreted into SchedulerNodes, but info
-    added on SchedulerNodes may not be entirely back-propogated to FX graph, e.g. a
-    SchedulerNode could be created without a corresponding FX node. It would be safer
-    not to directly rely on FX graph when possible. For example:
-    1. if we need to know the users of a schedulerNode, better check node.read_writes
-        instead of origin_node.args.
-    2. if we need a new LoopIR for a given schedulerNode, we could make changes to its
-        corresponding FX node then utilize GraphLowering.run_node(updated_fx_node) ->
-        new CompBuf -> new LoopIR. But in case corresponding FX node has defect to begin
-        with, we chose to hack the inner_fn then build a new LoopIR from there.
+    Simplified flow to create a new SchedulerNode, no FX graph involved:
+        new Pointwise (wrapped in a TensorBox) -> ComputedBuffer -> SchedulerNode
+
     NOTE:
-    - ONCE WE correctly updated args in "node.data(i.e. a LoopIR).inner_fn",
-      node.read_writes and node._body can be refreshed by calling node.recompute_body().
-      But need to make sure to clear cached body first.
+    - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR
+    - Once we correctly updated inner_fn (double check args in "node.data" i.e. a LoopIR),
+      node.read_writes and node._body can be refreshed by calling node.recompute_body(),
+      remember to clear cached body first.
+    - If we need to know the users of a schedulerNode, better check node.read_writes
+      instead of origin_node.args.
     - check Scheduler._replace_node() and fuse_nodes_once() for hints of important items
       that need to be updated.
     """
@@ -267,59 +303,40 @@ def try_insert_clone_nodes_for_inputs(
     scheduler = V.graph.scheduler
     fx_graph = V.graph.graph
 
-    buf_read_counts: dict[str, int] = {}
-    buf_users: dict[str, SchedulerNode] = {}
-    for n in nodes:
-        reads = n.get_read_write_buffer_accesses(
-            include_reads=True, include_writes=False
-        )
-        for b in reads.keys():
-            buf_read_counts[b] = buf_read_counts.get(b, 0) + 1
-            buf_users[b] = buf_users.get(b, [])
-            buf_users[b].append(n)
-            # TODO a node cannot read the same buf twice? no need to dedup?
-
     for inp_name in V.graph.graph_input_names:
         # Step 0: check how many times this buffer will be read, decide cloning or not
         buf = V.graph.get_buffer(inp_name)
         dev_layout = buf.layout.device_layout
         dev_size = math.prod(dev_layout.device_size[:-1]) * 128
         is_on_lx = buf.layout.allocation != {}
-        if buf_read_counts[inp_name] == 1 or dev_size > lx_free_total or is_on_lx:
+        used_only_once = len(buf_users[inp_name]) == 1
+        if (
+            used_only_once or
+            dev_size > lx_free_total or
+            is_on_lx or
+            core_div_mismatch[inp_name]
+        ):
             continue
 
-        # step 1: create a new FX node on FX graph and then refresh dependencies
+        # Step 1: Create a Pointwise IR -> a ComputedBuffer which has the same layout
+        #         as input (already FixedTileLayout) -> SchedulerNode
+        clone_IR_tb = clone_lowering(buf)  # a TensorBox wrapping a PointwiseIR
+        com_buf = ComputedBuffer(
+            name=None,
+            layout=buf.layout,
+            data=clone_IR_tb.data.data,
+        )
+        # create a "dangling" FX node, just to store meta data
         fx_inp = list(buf.origins)[0]
-        old_users = list(fx_inp.users.keys())  # get old users before insertion
-        fx_graph.inserting_after(fx_inp)
-        new_fx_node = fx_graph.create_node(
+        com_buf.origin_node = fx_graph.create_node(
             "call_function", ops.aten.clone.default, (fx_inp,)
         )
-        # update user's input (nodes.args is a tuple of fx nodes)
-        for user in old_users:
-            user.args = tuple(new_fx_node if ar is fx_inp else ar for ar in user.args)
-        V.graph.orig_gm.recompile()
-
-        # step 2: Use the new FX node -> new TensorBox -> new SchedulerNode
-        # NOTE .run_node(n) needs a {fx nodes: TensorBox} mapping for each elem in n.args
-        # e.g. new_fx_node.args=(arg0, ), env[arg0_1] -> point to arg0_1's TensorBox
-        env: dict = {}
-        for tbs in graph_lowering.name_to_users.values():
-            for tb in tbs:
-                tb_fx_node = list(tb.data.origins)[0]
-                if tb_fx_node in env and env[tb_fx_node] is not tb:
-                    raise ValueError("A TensorBox has more than 1 associated FX node.")
-                env[tb_fx_node] = tb
-        graph_lowering.env.update(env)
-        # graph_lowering.args_iter = graph_lowering.example_inputs  # doesn't seem needed anymore?
-        new_tb = graph_lowering.run_node(new_fx_node)
-        com_buf = new_tb.data.data
+        com_buf.name = V.graph.register_buffer(com_buf)
+        V.graph.register_operation(com_buf)
         new_sch_node = scheduler.create_scheduler_node(com_buf)
-        propagate_spyre_tensor_layouts([new_sch_node])
         new_buf_name = com_buf.name
-        graph_lowering.env[new_fx_node] = new_tb
 
-        # Update graph_lowering.name_to_users[inp_name] (a list of TensorBox). Existing
+        # Step 2: Update graph_lowering.name_to_users (a list of TensorBox), eg, existing
         # users of arg0, other than InpBuf and new_buf, should become users of new_buf.
         users_of_inp, users_of_new_buf = [], []
         for tb in graph_lowering.name_to_users[inp_name]:
@@ -330,7 +347,7 @@ def try_insert_clone_nodes_for_inputs(
         graph_lowering.name_to_users[inp_name] = users_of_inp
         graph_lowering.name_to_users[new_buf_name] = users_of_new_buf
 
-        # Step 3: Update user nodes of arg0_1 -> change it to new_buf
+        # Step 3: Update user nodes's inner_fn, _body, read_writes of old_buf -> new_buf
         for n_user in buf_users[inp_name]:
             old_com_buf = n_user.node
             # hack inner_fn with a nameSwapper ops handler and make a new LoopIR
@@ -370,14 +387,25 @@ def scratchpad_planning(
 
     alloc = ScratchPadAllocator()
 
-    nodes = try_insert_clone_nodes_for_inputs(nodes, alloc.get_available_total())
-    node_idx_to_dealloc_bufs = buf_end_of_life_analysis(nodes)
+    idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
+
+    # TODO disable node insertion for now due to unresolved backend issue
+    # num_nodes_before = len(nodes)
+    # nodes = try_insert_clone_nodes_for_inputs(
+    #     nodes,
+    #     alloc.get_available_total(),
+    #     buf_users,
+    #     core_div_mismatch,
+    # )
+
+    # if len(nodes) > num_nodes_before:
+    #     idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
 
     for idx, n in enumerate(nodes):
         # release unneeded LX allocations before actual planning
-        alloc.deallocate(node_idx_to_dealloc_bufs.get(idx, []))
+        alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
 
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            consider_for_scratchpad(n, alloc, idx)
+            consider_for_scratchpad(n, alloc, idx, core_div_mismatch)
     # print(alloc.lx_usage_hist)
     return nodes
