@@ -19,6 +19,7 @@ import unittest
 import psutil
 import warnings
 from contextlib import contextmanager
+import pytest
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -303,6 +304,56 @@ class TestSpyre(TestCase):
 
         dev = torch._C._get_accelerator()
         assert str(dev) == "spyre"
+
+    def test_memory_allocated(self):
+        torch.spyre.memory.reset_peak_memory_stats()
+        torch.spyre.memory.reset_accumulated_memory_stats()
+
+        prev_allocated = torch.spyre.memory.memory_allocated()
+        prev_max_allocated = torch.spyre.memory.max_memory_allocated()
+
+        self.assertEqual(
+            prev_allocated, prev_max_allocated
+        )  # Due to reset_peak_memory_stats
+        x = torch.rand((64, 64), dtype=torch.float16)
+        mem_size = x.numel() * x.element_size()  # 8192 bytes
+        self.assertEqual(x.device.type, "cpu")
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        x = x.to("spyre")
+        self.assertEqual(x.device.type, "spyre")
+        self.assertEqual(
+            torch.spyre.memory.memory_allocated(), prev_allocated + mem_size
+        )
+
+        del x
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        # Test max
+        self.assertEqual(
+            torch.spyre.memory.max_memory_allocated(), prev_max_allocated + mem_size
+        )
+
+    def test_spyre_device_count_and_set_device(self):
+        count = torch.spyre.device_count()
+
+        assert isinstance(count, int)
+        assert count > 0
+
+        orig = torch.spyre.current_device()
+
+        try:
+            for i in range(min(2, count)):
+                torch.spyre.set_device(i)
+                assert torch.spyre.current_device() == i
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(count)
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(-1)
+        finally:
+            torch.spyre.set_device(orig)
 
 
 if __name__ == "__main__":

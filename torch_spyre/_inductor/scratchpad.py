@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-import os
+
 from torch._inductor.ir import (
     ComputedBuffer,
 )
@@ -27,6 +27,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 from torch import ops
 from .logging_utils import get_inductor_logger
+from . import config
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
@@ -44,9 +45,7 @@ class ScratchPadAllocator:
         # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
         # for backend usage unless specified otherwise
         if size == -1:
-            size = int(
-                (2 << 20) * (1.0 - float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2")))
-            )
+            size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         self.limit = size
         self.usage: dict = {}  # each record will be tensor_name:{"addr": yy, "size": zz}
         self.lx_usage_hist: list = []
