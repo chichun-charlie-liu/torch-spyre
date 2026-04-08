@@ -181,6 +181,12 @@ def consider_for_scratchpad(
     idx: int,
     core_div_mismatch: dict[str, bool] = {},
 ):
+    """
+    If core_div_mismatch is not provided, we will consider LX pinning without taking
+    core division into account (previous behavior), may result in slices of a LX tensor
+    scattered over different core's scratchpad, which may result in unusable tensor and
+    incorrect results.
+    """
     # 1. summarize both inputs and output sizes used by this node.
     mem_usage = mem_usage_by_node(n)
     for buf in mem_usage:
@@ -212,7 +218,7 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
             last_used[buf] = idx
             if buf in buf_read_by_n:
                 buf_read_counts[buf] = buf_read_counts.get(buf, 0) + 1
-                buf_users[buf] = buf_users.get(buf,[]) + [n]
+                buf_users[buf] = buf_users.get(buf, []) + [n]
             else:
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
 
@@ -225,7 +231,7 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
             bufs_to_dealloc_at_idx[idx + 1] = [buf]
 
     # Check core-division -> If the node generating the buffer and any of the nodes
-    # consuming this buffer have different core division => do not pin this buffer to LX 
+    # consuming this buffer have different core division => do not pin this buffer to LX
     # NOTE Because each core can only write to its own scratchpad. For example, if a
     #       buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> next op
     #       has to read from 2 different scratchpads...
@@ -311,10 +317,10 @@ def try_insert_clone_nodes_for_inputs(
         is_on_lx = buf.layout.allocation != {}
         used_only_once = len(buf_users[inp_name]) == 1
         if (
-            used_only_once or
-            dev_size > lx_free_total or
-            is_on_lx or
-            core_div_mismatch[inp_name]
+            used_only_once
+            or dev_size > lx_free_total
+            or is_on_lx
+            or core_div_mismatch[inp_name]
         ):
             continue
 

@@ -41,5 +41,5 @@ class SpyreSDSCKernelRunner:
             g2 = os.path.join(self.code_dirs[i], "g2.graph.cbor")
             logger.info(f"RUN: {self.kernel_name}_{i} {g2}")
             actuals = [args[i] for i in self.arg_mappings[i]] if len(args) > 0 else []
-            # args could be empty if both input and output tensors are on LX already 
+            # args could be empty if both input and output tensors are on LX already
             launch_kernel(g2, actuals)
