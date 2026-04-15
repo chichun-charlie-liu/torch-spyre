@@ -16,6 +16,8 @@ import math
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
 )
 from torch._inductor.lowering import clone as clone_lowering
 from torch._inductor.ops_handler import WrapperHandler
@@ -159,26 +161,26 @@ class ScratchPadAllocator:
     # TODO add dealloc and defrag mechanism to allocator later
 
 
-def mem_usage_by_node(n: SchedulerNode):
-    """Get a summary of memory usage of the input node"""
+def mem_usage_by_op(op: ComputedBuffer):
+    """Get a summary of memory usage of the input operation"""
+    rw = op.get_read_writes()
     mem_usage = {}
-    for r_or_w, buf_memDeps in enumerate([n.read_writes.reads, n.read_writes.writes]):
-        for buf_memDep in buf_memDeps:
-            buf = V.graph.get_buffer(buf_memDep.name)
+    for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+        for dep in deps:
+            buf = V.graph.get_buffer(dep.name)
             dev_layout = buf.layout.device_layout  # this is device layout
             dev_size = (
                 math.prod(dev_layout.device_size[:-1]) * 128
             )  # num_sticks * bytes_per_stick
-            mem_usage[buf_memDep.name] = {
-                "is_input": r_or_w == 0,
+            mem_usage[dep.name] = {
+                "is_input": is_input,
                 "size": dev_size,
             }
 
     return mem_usage
 
-
 def consider_for_scratchpad(
-    n: SchedulerNode,
+    op: ComputedBuffer,
     alloc: ScratchPadAllocator,
     idx: int,
     core_div_mismatch: dict[str, bool] = {},
@@ -190,18 +192,18 @@ def consider_for_scratchpad(
     incorrect results.
     """
     # 1. summarize both inputs and output sizes used by this node.
-    mem_usage = mem_usage_by_node(n)
+    mem_usage = mem_usage_by_op(op)
     for buf in mem_usage:
         mem_usage[buf]["core_div_mismatch"] = core_div_mismatch.get(buf, False)
         # if a buf is not in core_div_mismatch => it has no users => graph output
 
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
-    org_op_name = n.node.origin_node.target._opname
+    org_op_name = op.origin_node.target._opname
     alloc.try_allocate(mem_usage, idx, org_op_name)
 
 
-def buf_analysis(nodes: list[BaseSchedulerNode]):
+def buf_analysis(operations: list[Operation]):
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
     Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
@@ -213,18 +215,17 @@ def buf_analysis(nodes: list[BaseSchedulerNode]):
     buf_users_read_and_write: dict[str, SchedulerNode] = {}
     core_div_mismatch: dict[str, bool] = {}
 
-    for idx, n in enumerate(nodes):
-        buf_read_by_n = n.get_read_write_buffer_accesses(
-            include_reads=True, include_writes=False
-        )  # its {"buf_name": bytes read, ...}
-        for buf in n.used_buffer_names():  # just buf names
+    for idx, op in enumerate(operations):
+        rw = op.get_read_writes()
+        buf_read_by_op = rw.reads
+        for buf in op.used_buffer_names():  # just buf names
             last_used[buf] = idx
-            if buf in buf_read_by_n:
+            if buf in buf_read_by_op:
                 buf_read_counts[buf] = buf_read_counts.get(buf, 0) + 1
-                buf_users[buf] = buf_users.get(buf, []) + [n]
+                buf_users[buf] = buf_users.get(buf, []) + [op]
             else:
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
-            buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [n]
+            buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -395,32 +396,33 @@ def try_insert_clone_nodes_for_inputs(
 
 
 def scratchpad_planning(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    # Nodes are in topological order (guarenteed by caller).
-    # Work division has already been done.
+    operations: list[Operation],
+) -> None:
+    # Operations are in topological order (guaranteed by GraphLowering).
+    # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBeffers have FixedTiledLayouts)
 
     alloc = ScratchPadAllocator()
 
-    idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
+    idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
-    num_nodes_before = len(nodes)
-    nodes = try_insert_clone_nodes_for_inputs(
-        nodes,
+    num_ops_before = len(operations)
+    operations = try_insert_clone_nodes_for_inputs(
+        operations,
         alloc.get_available_total(),
         buf_users,
         core_div_mismatch,
     )
 
-    if len(nodes) > num_nodes_before:
-        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(nodes)
+    if len(operations) > num_ops_before:
+        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
-    for idx, n in enumerate(nodes):
+    for idx, op in enumerate(operations):
         # release unneeded LX allocations before actual planning
         alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
 
-        if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            consider_for_scratchpad(n, alloc, idx, core_div_mismatch)
-    # print(alloc.lx_usage_hist)
-    return nodes
+        if isinstance(op, ComputedBuffer):
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                continue
+            consider_for_scratchpad(op, alloc, idx, core_div_mismatch)
+    # logger.info(alloc.lx_usage_hist)
