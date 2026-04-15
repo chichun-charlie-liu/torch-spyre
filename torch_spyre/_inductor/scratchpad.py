@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import math
 
 from torch._inductor.ir import (
@@ -162,7 +163,7 @@ class ScratchPadAllocator:
 
 
 def mem_usage_by_op(op: ComputedBuffer):
-    """Get a summary of memory usage of the input operation"""
+    """Get a summary of memory usage of the input operation."""
     rw = op.get_read_writes()
     mem_usage = {}
     for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
@@ -218,6 +219,10 @@ def buf_analysis(operations: list[Operation]):
     for idx, op in enumerate(operations):
         rw = op.get_read_writes()
         buf_read_by_op = rw.reads
+        # TODO update the following
+        # reference:
+        # for dep in itertools.chain(rw.reads, rw.writes):
+        #     last_used[dep.name] = idx
         for buf in op.used_buffer_names():  # just buf names
             last_used[buf] = idx
             if buf in buf_read_by_op:
