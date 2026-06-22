@@ -23,21 +23,22 @@ from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 ])
 def test_fp16_to_fp32_produces_dl16_to_fp32(device, shape):
     """Test that FP16→FP32 conversion produces DL16_TO_FP32 EA for various shapes.
-    
+
     This validates the fix for issue #2788: get_spyre_tensor_layout() should
     return DL16_TO_FP32 for FP16→FP32 conversions, not STANDARD.
     """
-    
+
     @torch.compile
     def fn(x):
         return x.to(torch.float32)
-    
+
     x = torch.randn(*shape, device=device, dtype=torch.float16)
     result = fn(x)
-    
+
     # Verify EA is DL16_TO_FP32
     result_layout = get_spyre_tensor_layout(result)
-    assert result_layout.element_arrangement == ElementArrangement.DL16_TO_FP32, \
-        f"Shape {shape}: Expected DL16_TO_FP32, got {result_layout.element_arrangement}"
+    assert (
+        result_layout.element_arrangement == ElementArrangement.DL16_TO_FP32
+    ), f"Shape {shape}: Expected DL16_TO_FP32, got {result_layout.element_arrangement}"
 
 # Made with Bob
