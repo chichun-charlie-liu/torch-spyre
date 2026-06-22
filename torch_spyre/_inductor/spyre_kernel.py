@@ -871,7 +871,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 ea_str = str(stl.element_arrangement)
                 wrapper.writeline(
                     f"set_spyre_tensor_layout({buf_name}, "
-                    f"get_spyre_tensor_layout({buf_name}).with_element_arrangement({ea_str}))"
+                    f"get_spyre_tensor_layout({buf_name})."
+                    f"with_element_arrangement({ea_str}))"
                 )
 
 
