@@ -60,10 +60,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import (
                     DataFormats,
-                    ElementArrangement,
                     SpyreTensorLayout,
-                    get_spyre_tensor_layout,
-                    set_spyre_tensor_layout,
                     spyre_empty_with_layout,
                 )
                 import subprocess
