@@ -278,9 +278,39 @@ def _single_arg_op_layout(
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
-            fmt = ElementArrangement.STANDARD
+            input_ea = stl.element_arrangement
+            
+            # Determine output EA based on conversion direction and input EA
             if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                fmt = ElementArrangement.DL16_TO_FP32
+                # FP16 → FP32 conversion
+                if input_ea == ElementArrangement.STANDARD:
+                    # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
+                    fmt = ElementArrangement.DL16_TO_FP32
+                elif input_ea == ElementArrangement.FP32_TO_DL16:
+                    # Case 2: FP32_TO_DL16 → STANDARD (restoration)
+                    fmt = ElementArrangement.STANDARD
+                else:
+                    # Unexpected input EA for FP16→FP32
+                    raise Unsupported(
+                        f"FP16→FP32 conversion with unsupported input EA: {input_ea}"
+                    )
+            elif in_layout.dtype == torch.float32 and output.dtype == torch.float16:
+                # FP32 → FP16 conversion
+                if input_ea == ElementArrangement.STANDARD:
+                    # Case 3: STANDARD → FP32_TO_DL16 (creates staggered layout)
+                    fmt = ElementArrangement.FP32_TO_DL16
+                elif input_ea == ElementArrangement.DL16_TO_FP32:
+                    # Case 4: DL16_TO_FP32 → STANDARD (restoration)
+                    fmt = ElementArrangement.STANDARD
+                else:
+                    # Unexpected input EA for FP32→FP16
+                    raise Unsupported(
+                        f"FP32→FP16 conversion with unsupported input EA: {input_ea}"
+                    )
+            else:
+                # Other type conversions default to STANDARD
+                fmt = ElementArrangement.STANDARD
+            
             unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 
             if unaligned > 0:

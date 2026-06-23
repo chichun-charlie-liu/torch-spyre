@@ -43,6 +43,8 @@ enum class ElementArrangement {
                  // conversions
   QFP8CH,        // non-sequential order produced by on-device fp8 channel
                  // quantization (qfp8ch)
+  FP32_TO_DL16,  // non-sequential order produced by fp32->dl16 on-device
+                 // conversions
   EXX2,          // reduction mode: two values per stick (vs. one for standard
                  // reductions)
 };
