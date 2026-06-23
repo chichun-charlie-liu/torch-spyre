@@ -19,7 +19,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
+from torch_spyre._C import DataFormats
 
 from torch._inductor.codegen.common import (
     CSEVariable,
