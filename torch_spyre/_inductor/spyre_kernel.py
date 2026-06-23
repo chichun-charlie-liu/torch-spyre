@@ -863,8 +863,6 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
-        # Note: Element arrangement is now set at allocation time via
-        # SpyreTensorLayout::toString(), so no need to set it after kernel execution
 
 
 def _indirect_syms_used(
