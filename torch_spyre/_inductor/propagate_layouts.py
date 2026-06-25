@@ -357,9 +357,9 @@ def _single_arg_op_layout(
         and same_device_size(in_layout.dtype, output.dtype)
     ):
         # Input and output tensors are being accessed identically and elem size is the same.
-        # We can simply propagate the device_layout.
+        # We can simply propagate the device_layout including ElementArrangement.
         stl = SpyreTensorLayout(
-            stl.device_size, stl.stride_map, get_device_dtype(output.dtype)
+            stl.device_size, stl.stride_map, get_device_dtype(output.dtype), stl.element_arrangement
         )
         return [stl]
 
@@ -620,8 +620,51 @@ def _multi_arg_pointwise_layouts(
        1. Compute set of output stick expressions possible given the input layouts,
           keeping only those that produce a supported stick expression on every input.
        2. Compute an out STL for each; fall back to alternate output dims if none survive.
-       3. Construct the AllSameNode cost function since in and out sticks must always match
+       3. Determine output ElementArrangement based on input EAs (propagate staggered EA if present)
+       4. Construct the AllSameNode cost function since in and out sticks must always match
     """
+
+    # Determine output ElementArrangement from inputs
+    # Collect all unique EAs from input SpyreTensorLayouts
+    input_eas = set()
+    for arg in args:
+        if arg.layouts:
+            # Get EA from first SpyreTensorLayout (all should have same EA for this input)
+            input_eas.add(arg.layouts[0].element_arrangement)
+
+    # Determine output EA based on input EAs
+    staggered_eas = {ElementArrangement.DL16_TO_FP32, ElementArrangement.FP32_TO_DL16}
+    staggered_inputs = input_eas & staggered_eas
+
+    if len(staggered_inputs) > 1:
+        # Multiple different staggered EAs - not supported
+        raise Unsupported(
+            f"Multi-arg pointwise with multiple staggered EAs not supported: {input_eas}"
+        )
+    elif len(staggered_inputs) == 1:
+        # One staggered EA with potential STANDARD inputs
+        # Hardware constraint: STANDARD inputs must have stick dimension size 1
+        # to broadcast correctly with staggered element ordering
+        output_ea = next(iter(staggered_inputs))
+
+        # Verify STANDARD inputs have stick dimension size 1
+        for arg in args:
+            if arg.layouts and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD:
+                arg_size = arg.layout.size
+                if len(arg_size) == 0:
+                    # Scalar - always compatible
+                    continue
+
+                arg_stick_size = arg_size[-1]  # Stick is last dimension
+                if arg_stick_size != 1:
+                    raise Unsupported(
+                        f"Multi-arg pointwise with mixed EA: STANDARD input must have "
+                        f"stick dimension size 1 for broadcast compatibility with staggered EA. "
+                        f"Got stick size {arg_stick_size}"
+                    )
+    else:
+        # All STANDARD or other EAs - use STANDARD
+        output_ea = ElementArrangement.STANDARD
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     # Collect all unique non-zero stick expressions from input layouts
@@ -664,7 +707,7 @@ def _multi_arg_pointwise_layouts(
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
-                c_in_size, c_in_stride, output.dtype, projected_dim_order
+                c_in_size, c_in_stride, output.dtype, projected_dim_order, output_ea
             )
             coord = device_coordinates(in_stl, arg.dep, ind_sizes)
             if not is_stick_expr_offset_free(coord[-1], stick_size):
@@ -674,7 +717,7 @@ def _multi_arg_pointwise_layouts(
     def _try_stick_dim(stick_dim):
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
-            results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order))
+            results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea))
 
     results: list[SpyreTensorLayout] = []
 
@@ -685,6 +728,8 @@ def _multi_arg_pointwise_layouts(
                 template_stl.device_size,
                 template_stl.stride_map,
                 get_device_dtype(output.dtype),
+                template_stl.dim_order,
+                output_ea,
             )
         )
     elif not stick_exprs:
