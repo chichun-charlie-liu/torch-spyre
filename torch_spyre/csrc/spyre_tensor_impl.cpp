@@ -198,23 +198,7 @@ std::string SpyreTensorLayout::toString() const {
   ss << "], device_dtype=DataFormats.";
   ss << EnumsConversion::dataFormatsToString(this->device_dtype);
   ss << ", element_arrangement=ElementArrangement.";
-  switch (this->element_arrangement) {
-    case ElementArrangement::STANDARD:
-      ss << "STANDARD";
-      break;
-    case ElementArrangement::DL16_TO_FP32:
-      ss << "DL16_TO_FP32";
-      break;
-    case ElementArrangement::FP32_TO_DL16:
-      ss << "FP32_TO_DL16";
-      break;
-    case ElementArrangement::DL16_TO_FP8:
-      ss << "DL16_TO_FP8";
-      break;
-    case ElementArrangement::EXX2:
-      ss << "EXX2";
-      break;
-  }
+  ss << spyre::elementArrangementToString(this->element_arrangement);
   ss << ")";
   return ss.str();
 }
