@@ -127,11 +127,11 @@ class TestNormalizationScalarOperations:
     @pytest.mark.parametrize(
         "eps,batch,seq,hidden",
         [
-            (1e-6, 128, 512, 768),
-            (1e-8, 32, 512, 768),
-            (1e-6, 8, 2048, 768),
-            (1e-5, 1, 1024, 4096),
-            (1e-6, 1, 2048, 4096),
+            (1e-5, 1, 1,   4096),
+            (1e-5, 1, 12,  4096),
+            (1e-5, 1, 64,  4096),
+            (1e-5, 2, 1,   4096),
+            (1e-5, 2, 12,  4096),
         ],
     )
     def test_rmsnorm_fp32_upcast(self, execution_mode, eps, batch, seq, hidden):

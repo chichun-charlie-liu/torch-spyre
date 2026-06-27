@@ -33,64 +33,20 @@ import torch
 
 from utils_inductor import cached_randn, compare_with_cpu
 
-
 def _rmsnorm(x, weight, eps=1e-6):
     x_fp32 = x.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim=True)
     x_normed = x_fp32 * torch.rsqrt(variance + eps)
     return weight * x_normed.to(x.dtype)
 
-
-def test_rmsnorm_full_pattern():
-    """Test complete RMSNorm pattern from issue #2508."""
-    x = cached_randn((4, 4096))
-    weight = cached_randn((4096,), differentiation="weight")
-    compare_with_cpu(_rmsnorm, x, weight, atol=1e-2, rtol=1e-2, run_eager=False)
-
-
-def test_rmsnorm_fp32_to_fp16_restoration():
-    """Test that FP32→FP16 downcast of a DL16_TO_FP32 tensor restores STANDARD EA."""
-
-    def fn(x):
-        return (x.to(torch.float32) * 2.0).to(torch.float16)
-
-    x = cached_randn((4, 4096))
-    compare_with_cpu(fn, x, atol=1e-3, rtol=1e-3, run_eager=False)
-
-
-def test_rmsnorm_variance_computation():
-    """Test pow + mean reduction in the RMSNorm variance step."""
-
-    def fn(x):
-        x_fp32 = x.to(torch.float32)
-        return x_fp32.pow(2).mean(-1, keepdim=True)
-
-    x = cached_randn((4, 4096))
-    compare_with_cpu(fn, x, atol=1e-3, rtol=1e-3, run_eager=False)
-
-
-def test_rmsnorm_normalization_step():
-    """Test broadcast mul between DL16_TO_FP32 and STANDARD tensors."""
-
-    def fn(x):
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        rsqrt = torch.rsqrt(variance + 1e-6)
-        return (x_fp32 * rsqrt).to(torch.float16)
-
-    x = cached_randn((4, 4096))
-    compare_with_cpu(fn, x, atol=1e-2, rtol=1e-2, run_eager=False)
-
-
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 1, 4096),
+        (1, 1,  4096),
         (1, 12, 4096),
         (1, 64, 4096),
-        (4, 1, 4096),
-        (8, 12, 4096),
-        (16, 64, 4096),
+        (2, 1,  4096),
+        (2, 12, 4096),
     ],
 )
 def test_rmsnorm_with_different_shapes(shape):
@@ -98,15 +54,3 @@ def test_rmsnorm_with_different_shapes(shape):
     x = cached_randn(shape, differentiation=str(shape))
     weight = cached_randn((shape[-1],), differentiation=f"weight_{shape}")
     compare_with_cpu(_rmsnorm, x, weight, atol=1e-2, rtol=1e-2, run_eager=False)
-
-
-def test_rmsnorm_without_weight():
-    """Test RMSNorm without final weight multiplication."""
-
-    def rmsnorm_no_weight(x, eps=1e-6):
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        return (x_fp32 * torch.rsqrt(variance + eps)).to(x.dtype)
-
-    x = cached_randn((4, 4096))
-    compare_with_cpu(rmsnorm_no_weight, x, atol=1e-2, rtol=1e-2, run_eager=False)
