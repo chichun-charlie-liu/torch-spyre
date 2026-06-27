@@ -11,6 +11,3 @@ test_suite_config:
             - element-arrangement
             - spyre-tensor-layout
 
-# Test for issue #2788: get_spyre_tensor_layout() returns correct ElementArrangement
-
-# Made with Bob

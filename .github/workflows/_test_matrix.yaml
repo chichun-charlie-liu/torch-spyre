@@ -217,6 +217,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
           - name: Inductor Spyre Tensor Layout EA
             config: torch_spyre_tests/inductor/test_spyre_tensor_layout_ea_config.yaml
+          - name: Inductor EA RMSNorm
+            config: torch_spyre_tests/inductor/test_ea_rmsnorm_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
