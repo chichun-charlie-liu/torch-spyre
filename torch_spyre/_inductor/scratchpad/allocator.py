@@ -92,6 +92,9 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.scratchpad.lx_context_switching import (
+    LxContextSwitchingPass,
+)
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
@@ -445,7 +448,15 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if _extern_kernel_in_live_range(graph, uses):
+        # PR3683's guard: reject residency outright rather than let LX context
+        # switching (dump/restore around the risky call) handle it. Kept behind
+        # the flag, not deleted, so the old (conservative) and new (context
+        # switching) behaviors can still be compared -- see
+        # LxContextSwitchingPass in lx_dump_restore.py, which is the intended
+        # long-term replacement for this check.
+        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
+            graph, uses
+        ):
             return "extern kernel user or live across extern kernel"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
@@ -504,7 +515,13 @@ class ScratchpadAllocator:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
-        if _extern_kernel_in_live_range(graph, uses):
+        # See the matching comment in _buffer_residency_reason: kept behind
+        # config.enable_lx_context_switching rather than deleted, so the
+        # PR3683 guard and LxContextSwitchingPass's dump/restore can be
+        # compared during rollout.
+        if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
+            graph, uses
+        ):
             return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
@@ -2224,6 +2241,15 @@ def select_allocator() -> ScratchpadAllocator:
             f"Invalid layout_solver config option '{config.layout_solver}'."
         )
 
+    # LxContextSwitchingPass replaces PR3683's blanket "never pin a buffer to
+    # LX across an extern kernel" guard with a real fix (bracket the risky
+    # call with per-buffer dump/restore instead). Both are gated by the same
+    # flag -- see the matching comments on _extern_kernel_in_live_range's two
+    # call sites -- so this list is empty exactly when that guard is active.
+    post_optimization_passes: list[ScratchpadOptimizationPass] = (
+        [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
+    )
+
     if config.co_optimizing_lx_planning:
         if config.lx_planner_relayout:
             logger.warning(
@@ -2241,14 +2267,21 @@ def select_allocator() -> ScratchpadAllocator:
                 ),
                 size=size,
                 prune=True,
+                post_optimization_passes=post_optimization_passes,
             )
         # The isinstance check above just proved this factory's solver is a
         # CoreDivisionLayoutSolver at runtime; narrow the static type to match.
         return CoOptimizingAllocator(
-            layout_planning=cast(CoreDivisionSolverFactory, solver_cls), size=size
+            layout_planning=cast(CoreDivisionSolverFactory, solver_cls),
+            size=size,
+            post_optimization_passes=post_optimization_passes,
         )
 
-    return ScratchpadAllocator(layout_planning=solver_cls, size=size)
+    return ScratchpadAllocator(
+        layout_planning=solver_cls,
+        size=size,
+        post_optimization_passes=post_optimization_passes,
+    )
 
 
 def scratchpad_planning(

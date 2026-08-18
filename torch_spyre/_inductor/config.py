@@ -25,6 +25,14 @@ co_optimizing_lx_planning: bool = (
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
+# Bracket risky FallbackKernel calls (opaque device dispatches with no native
+# Spyre lowering, e.g. custom ops or ops/eager.py's nested-torch.compile'd
+# eager kernels) with per-buffer LX dump/restore clones, so a buffer this
+# graph still has LX-resident across such a call survives whatever the
+# opaque call's own kernel does to LX. Defaults on; set
+# ENABLE_LX_CONTEXT_SWITCHING=0 to disable for debugging/bisection.
+enable_lx_context_switching: bool = _get_env_bool("ENABLE_LX_CONTEXT_SWITCHING", True)
+
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 # Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
