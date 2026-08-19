@@ -1384,6 +1384,13 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     is correct.  Offering all valid choices lets the optimizer pick whichever
     is compatible with the rest of the graph at zero cost, avoiding a needless
     restickify.
+
+    NOTE: constant-fill ops in the main propagation loop currently use
+    generic_layout instead (a single default-layout candidate) to avoid
+    exponential beam-state growth in loop-unrolled graphs.  This function is
+    still used for the accumulator fallback path (in-place update ops with no
+    real inputs) where the enumeration is bounded and correct.  It will also be
+    restored for the single-consumer constant case once that optimization lands.
     """
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
@@ -1438,6 +1445,25 @@ def _target_device_layout(target, name: str):
     # candidate layouts on the TensorBox rather than a finalized committed_stl.
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
+    if not layouts:
+        # Also check candidate layouts set by propagate_layouts on the producing
+        # ComputedBuffer (e.g. a constant-fill op that precedes the copy_forced).
+        # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
+        # synthetic buffers whose layouts must be derived from their first
+        # writer, not locked here. Only use this when the producer has a
+        # single unambiguous candidate: with multiple candidates, arbitrarily
+        # picking next(iter(...)) here would lock the mutation op (and
+        # everything downstream of it) onto one candidate even when the
+        # beam search needs the freedom to pick a different one -- mirrors
+        # the same single-candidate guard in the copy-back elision pass
+        # above.
+        buf = V.graph.get_buffer(name) if name else None
+        if buf is not None and not isinstance(
+            buf, (SpyreEmptyFallback, SpyreConstantFallback)
+        ):
+            buf_layouts = getattr(buf, "layouts", None)
+            if buf_layouts and len(buf_layouts) == 1:
+                layouts = buf_layouts
 
     if not layouts:
         return None
@@ -1907,7 +1933,11 @@ def propagate_spyre_tensor_layouts(
                     for r in mem_reads
                 )
                 if is_constant_fill:
-                    op.layouts = _all_constant_layouts(op)
+                    # Constant-fill ops (zeros_like, full, ones_like, ...) have no real
+                    # memory layout — they can materialize in any stick orientation.
+                    # For now, using a single generic layout candidate to reduce beam
+                    # state space explosion.  Optimizations to follow.
+                    op.layouts = [generic_layout(op)]
                 else:
                     logger.warning(
                         f"{op.get_name()} has no propagatable args but reads non-constant "
