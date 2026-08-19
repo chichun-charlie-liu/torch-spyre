@@ -275,6 +275,16 @@ def _restore_buffers(
         restore_buf.origins.add(restore_fx)
         restore_buf.origin_node = restore_fx
         copy_op_metadata(buf, restore_buf)
+        # Without this, restore_buf defaults to an untiled single-core view,
+        # which disagrees with buf's own 32-core split as seen by buf's other
+        # users. Since this write aliases buf's own layout object (via
+        # MutationLayoutSHOULDREMOVE), that disagreement isn't just cosmetic:
+        # the scheduler's LX-relayout consistency check (scheduler.py's
+        # demote()) treats it as an invalid view and pops "lx" from buf's own
+        # (shared) allocation dict -- silently demoting buf out of LX
+        # entirely, turning the whole bracket into dead weight (dump/restore
+        # clones around a buffer that no longer resides on LX at all).
+        restore_buf.op_it_space_splits = getattr(buf, "op_it_space_splits", ({}, {}))
         restore_buf.name = graph.register_buffer(restore_buf)
         graph.register_operation(restore_buf)
 
@@ -305,17 +315,33 @@ def _order_around_bracket(
     upstream's own mechanism for a "fake dependency on an unused buffer... to
     prevent some specific reordering" (unused elsewhere in torch-spyre).
     Scheduler.__init__ converts these into real WeakDep edges (is_fake=True:
-    ordering-only, no lifetime extension) once scheduler nodes exist.
-    Confirmed correct for single-output FallbackKernels (BaseSchedulerNode.get_name()
-    delegates to the underlying op's get_operation_name(), matching the keys
-    used here); multi-output kernels are excluded upstream in
-    _select_bracket_targets.
+    ordering-only, no lifetime extension) once scheduler nodes exist, by
+    iterating `additional_buffer_deps[node.get_name()]` for each scheduler
+    node and adding a WeakDep on each entry.
+
+    Two different names are in play here and they are NOT interchangeable:
+    `register_buffer`/`register_operation` (graph.py) draw from independent
+    "bufN"/"opN" counters, so a FallbackKernel's buffer name and operation
+    name are, in general, different strings (unlike a plain ComputedBuffer,
+    where they typically coincide). `BaseSchedulerNode.get_name()` delegates
+    to the underlying op's get_operation_name() -- so a dict *key* here must
+    be an operation name, to match the scheduler node currently being
+    visited. But a dict *value* is a dependency target resolved via
+    `Scheduler.name_to_buf` (a real buffer name) -- so a value naming a
+    FallbackKernel must be its get_name(), not get_operation_name(), or
+    `compute_ancestors` raises KeyError looking it up. Confirmed correct for
+    single-output FallbackKernels; multi-output kernels are excluded
+    upstream in _select_bracket_targets.
     """
-    extern_name = target_op.get_operation_name()
+    extern_op_name = target_op.get_operation_name()  # key: matches the
+    # scheduler node currently being visited
+    extern_buf_name = target_op.get_name()  # value: resolved via name_to_buf
     for dump_buf in dump_bufs:
-        graph.additional_buffer_deps[extern_name].add(dump_buf.get_name())
+        graph.additional_buffer_deps[extern_op_name].add(dump_buf.get_name())
     for restore_buf in restore_bufs:
-        graph.additional_buffer_deps[restore_buf.get_operation_name()].add(extern_name)
+        graph.additional_buffer_deps[restore_buf.get_operation_name()].add(
+            extern_buf_name
+        )
 
 
 class LxContextSwitchingPass(ScratchpadOptimizationPass):

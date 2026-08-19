@@ -38,6 +38,8 @@ from unittest.mock import patch
 
 import torch
 
+from torch._inductor import config as t_inductor_config
+
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.scratchpad.lx_context_switching import (
@@ -114,10 +116,19 @@ class TestLxContextSwitching(unittest.TestCase):
         _launch = False
         torch.manual_seed(0xC0FFEE)
         torch.compiler.reset()
+        # This op/model pair is reused across every test method (and across
+        # manual debugging runs), so the on-disk FxGraphCache can serve a
+        # stale artifact compiled under a *different*
+        # config.enable_lx_context_switching value -- that value isn't part
+        # of upstream Inductor's own cache-key inputs. Matches
+        # test_scratchpad_use.py's BaseTestScratchpadUsage.setUp.
+        self._caches_disabled = t_inductor_config.patch("force_disable_caches", True)
+        self._caches_disabled.__enter__()
 
     def tearDown(self):
         global _launch
         _launch = False
+        self._caches_disabled.__exit__(None, None, None)
         torch.compiler.reset()
 
     def _run_launch_diff(self, layers: int, n: int) -> float:
