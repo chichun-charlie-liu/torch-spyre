@@ -58,11 +58,12 @@ def mark_lx_safe(
 ) -> None:
     """Opt an op out of LX dump/restore bracketing.
 
-    For an op whose author can guarantee its eager body never launches
-    another compiled Spyre program (so it can never clobber LX), this avoids
-    the (small, but nonzero) dump/restore cost around every call site.
-    Plain attribute assignment on the OpOverload/CustomOpDef -- torch.Tag is a
-    closed C++ enum with no room for a Spyre-specific value.
+    Use when an op's eager body is confirmed to never launch a nested
+    torch.compile, so it can never clobber LX (see customops.py's usage
+    for the safety contract and worked examples). Saves the small but
+    nonzero dump/restore cost around every call site. Plain attribute
+    assignment on the OpOverload/CustomOpDef -- torch.Tag is a closed C++
+    enum with no room for a Spyre-specific value.
     """
     op._spyre_lx_safe = True
 

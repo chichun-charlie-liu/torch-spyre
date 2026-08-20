@@ -20,6 +20,7 @@ from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
+from .scratchpad.lx_context_switching import mark_lx_safe
 
 aten = torch.ops.aten
 
@@ -942,3 +943,19 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     else:
         out_shape = out_shape[:dim] + out_shape[dim + 1 :]
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
+
+
+# LX-safe means: this op's eager body generates no intermediate buffer that
+# could get pinned to LX (today, that requires a nested torch.compile; plain
+# CPU work or a body that never touches a spyre tensor has nothing to plan).
+#
+# Getting this wrong is not symmetric: marking an unsafe op safe risks silent
+# wrong numerics (its nested compile can clobber a buffer already pinned
+# here); leaving a safe op unmarked only pays a performance tax (needless
+# dump/restore bracketing). When in doubt, don't mark it.
+mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
+mark_lx_safe(torch.ops.spyre.unfold.default)
+mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.max_dim_int64_fallback.default)
+mark_lx_safe(torch.ops.spyre.min_dim_int64_fallback.default)
+mark_lx_safe(torch.ops.spyre.max_default_int64_fallback.default)
