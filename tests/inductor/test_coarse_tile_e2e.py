@@ -6107,7 +6107,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         lx_planning is disabled here so the `a = x + y` intermediate isn't
         claimed by LX scratchpad planning first -- with LX planning on,
         `add`/`mul`/`sub` outputs are all LX-eligible by default (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
         scratchpad before hbm_pool_planning ever sees them, leaving every
         bundle's pool_size at 0 and proving nothing about the plumbing this
         test exists to check.
@@ -6294,7 +6294,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         With lx_planning enabled, the `a = x + y` intermediate is claimed by
         LX scratchpad planning before hbm_pool_planning ever sees it (see
-        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
         has no pool-eligible buffer and define_kernel() must omit the
         pool_size kwarg entirely rather than emit pool_size=0.
         """

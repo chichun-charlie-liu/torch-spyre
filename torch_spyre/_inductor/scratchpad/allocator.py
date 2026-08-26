@@ -85,7 +85,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     _is_read_advancing_anywhere,
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
-    OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -334,10 +334,10 @@ class ScratchpadAllocator:
         # with no device_layout and can never be LX-pinned.
         if not isinstance(op.layout, FixedTiledLayout):
             return False
-        # A planned source intentionally bypasses the profitability allowlist:
+        # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
         return config.allow_all_ops_in_lx_planning or (
-            self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
+            self._get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
             or op.get_name() in planned_lx_buffers
         )
 
