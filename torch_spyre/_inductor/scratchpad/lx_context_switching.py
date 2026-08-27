@@ -135,8 +135,11 @@ def _select_bracket_targets(
     that alone is not the signal; len(op.outputs) > 1 is) are skipped with a
     warning: the WeakDep target resolution in _order_around_bracket is only
     confirmed correct for single-output kernels. Left unbracketed rather than
-    risk an incorrect fix; today's pre-existing behavior for that case is
-    unchanged.
+    risk an incorrect fix; allocator.py's
+    _multi_output_extern_kernel_in_live_range refuses LX residency outright
+    for any buffer live across one of these, so the gap here does not leave
+    a buffer unprotected -- it just falls back to the conservative
+    PR3683-style guard for this one case, same as when the flag is off.
     """
     liveness = calculate_liveness(graph)
     targets: list[tuple[FallbackKernel, list[Buffer]]] = []

@@ -26,6 +26,7 @@ from torch._inductor.ir import (
     TensorBox,
     ComputedBuffer,
     ExternKernel,
+    FallbackKernel,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -146,6 +147,32 @@ def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
         isinstance(graph.operations[i], ExternKernel)
         for i in range(min(uses), max(uses) + 1)
     )
+
+
+def _multi_output_extern_kernel_in_live_range(
+    graph: GraphLowering, uses: list[int]
+) -> bool:
+    """True if a genuinely multi-output FallbackKernel runs while the buffer is live.
+
+    ``LxContextSwitchingPass`` (lx_context_switching.py's ``_select_bracket_targets``)
+    does not bracket multi-output FallbackKernels -- WeakDep target resolution in
+    ``_order_around_bracket`` is only confirmed correct for single-output kernels --
+    so a buffer whose only risky crossing is one of those gets no dump/restore
+    protection from the pass. Unlike the single-output case, this check runs
+    unconditionally (not gated on config.enable_lx_context_switching): the flag
+    only chooses between the old guard and the new pass for cases the new pass
+    actually handles, and this is not one of them.
+    """
+    if not uses:
+        return False
+    for i in range(min(uses), max(uses) + 1):
+        op = graph.operations[i]
+        if not isinstance(op, FallbackKernel):
+            continue
+        outputs = getattr(op, "outputs", None)
+        if outputs is not None and len(outputs) > 1:
+            return True
+    return False
 
 
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
@@ -452,12 +479,21 @@ class ScratchpadAllocator:
         # switching (dump/restore around the risky call) handle it. Kept behind
         # the flag, not deleted, so the old (conservative) and new (context
         # switching) behaviors can still be compared -- see
-        # LxContextSwitchingPass in lx_dump_restore.py, which is the intended
+        # LxContextSwitchingPass in lx_context_switching.py, which is the intended
         # long-term replacement for this check.
         if not config.enable_lx_context_switching and _extern_kernel_in_live_range(
             graph, uses
         ):
             return "extern kernel user or live across extern kernel"
+        # Unconditional, regardless of the flag above: LxContextSwitchingPass does
+        # not bracket multi-output FallbackKernels (see
+        # _multi_output_extern_kernel_in_live_range's docstring), so a buffer live
+        # across one gets no protection from either mechanism unless residency is
+        # refused here.
+        if config.enable_lx_context_switching and (
+            _multi_output_extern_kernel_in_live_range(graph, uses)
+        ):
+            return "live across multi-output extern kernel"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
