@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch._inductor.dependencies import MemoryDep
-from torch_spyre._C import SpyreTensorLayout
+from torch._inductor.ir import FixedLayout
+from torch._inductor.virtualized import V
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
@@ -26,13 +30,16 @@ from torch_spyre._inductor.pass_utils import (
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
+    _find_alt_target_stl,
 )
 from torch_spyre._inductor.views import (
+    _decompose_constant_offset,
+    align_tensors,
     compute_coordinates,
     normalize_coordinates,
     tiling_expr_to_device_expr,
 )
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
 
@@ -151,6 +158,68 @@ class TestCoordinates(TestCase):
         # offset 1855 = 3*600 + 1*30 + 25*1
         self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
 
+    def test_compute_coordinates_mixed_radix_flattened_dim(self):
+        """A flattened H*D loop maps back to separate H and D coordinates."""
+        lq, hd = sympy.symbols("lq hd", integer=True, nonnegative=True)
+        with V.set_graph_handler(SimpleNamespace()):
+            repeat_info: dict = {}
+            cx = compute_coordinates(
+                [1, 32, 64, 128],
+                [262144, 8192, 128, 1],
+                {lq: 64, hd: 4096},
+                128 * lq
+                + 8192 * ModularIndexing(hd, 128, 32)
+                + ModularIndexing(hd, 1, 128),
+                repeat_info_out=repeat_info,
+            )
+            self.assertEqual(
+                cx,
+                [0, sympy.Mod(FloorDiv(hd, 128), 32), lq, sympy.Mod(hd, 128)],
+            )
+
+            terms = normalize_coordinates(
+                {lq: 64, hd: 4096},
+                [1, 32, 64, 128],
+                cx,
+                lambda: sympy.Symbol("z0"),
+            )
+            high_digit = next(
+                term for term in terms if term.var == hd and term.dim_size == 32
+            )
+            self.assertEqual(high_digit.den, 128)
+            self.assertEqual(high_digit.mod, 4096)
+
+            iteration_space, tensors, remap = align_tensors(
+                {lq: (64, 1), hd: (4096, 1)},
+                [{"size": [1, 32, 64, 128], "coordinates": cx}],
+                repeat_info=repeat_info,
+            )
+            self.assertEqual(iteration_space[hd][0], 128)
+            self.assertEqual(remap[hd][0], (hd, 1))
+            high_var = remap[hd][1][0]
+            self.assertEqual(iteration_space[high_var][0], 32)
+            self.assertTrue(all(size > 0 for size in tensors[0]["size"]))
+
+    def test_compute_coordinates_rejects_overlapping_moduli(self):
+        """Multiple Mods remain unsupported unless they form one digit chain."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                6 * (p0 % 4) + p0 % 6,
+            )
+
+    def test_compute_coordinates_rejects_fractional_mixed_radix_coefficient(self):
+        """An unsupported digit scale is rejected before normalization."""
+        with self.assertRaisesRegex(Unsupported, "multiple Mod"):
+            compute_coordinates(
+                [4, 6],
+                [6, 1],
+                {p0: 24},
+                sympy.Rational(3, 2) * (p0 % 4) + 6 * sympy.Mod(FloorDiv(p0, 4), 6),
+            )
+
     def test_compute_device_coordinates(self):
         # B, S, E -> B, E/H, S, H
         cx = compute_coordinates(
@@ -215,6 +284,76 @@ class TestCoordinates(TestCase):
             5760 * p0 + 384 * p1 + p2 + 128,
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
+
+    def test_offset_across_padded_row_stays_stick_offset_free(self):
+        # Regression: a non-stick offset on a padded row (row width not a
+        # multiple of elem_in_stick) must not leak a residual onto the stick
+        # coordinate. See _decompose_constant_offset.
+        cases = [
+            (
+                "single_row",  # base=(4,100) fp16 [1:, :], offset=100 == 1 row
+                [2, 4, 64],
+                [64, 100, 1],
+                {p0: 3, p1: 100},
+                100 + 100 * p0 + p1,
+                [p1 // 64, p0 + 1, p1 % 64],
+            ),
+            (
+                "multi_row",  # base=(5,100)[2:, :], offset=200 == 2 rows
+                [2, 5, 64],
+                [64, 100, 1],
+                {p0: 3, p1: 100},
+                200 + 100 * p0 + p1,
+                [p1 // 64, p0 + 2, p1 % 64],
+            ),
+            (
+                "wider_padding",  # base=(4,130) pads to 192 (3 sticks), [1:, :]
+                [3, 4, 64],
+                [64, 130, 1],
+                {p0: 3, p1: 130},
+                130 + 130 * p0 + p1,
+                [p1 // 64, p0 + 1, p1 % 64],
+            ),
+            (
+                "multi_dim",  # base=(3,3,100)[1:, :, :], offset=300 == 1 block
+                [2, 3, 3, 64],
+                [64, 300, 100, 1],
+                {p0: 2, p1: 3, p2: 100},
+                300 + 300 * p0 + 100 * p1 + p2,
+                [p2 // 64, p0 + 1, p1, p2 % 64],
+            ),
+            (
+                "middle_dim",  # base=(3,5,100)[:, 2:, :], offset=200 == 2 rows
+                [2, 3, 5, 64],
+                [64, 500, 100, 1],
+                {p0: 3, p1: 3, p2: 100},
+                200 + 500 * p0 + 100 * p1 + p2,
+                [p2 // 64, p0, p1 + 2, p2 % 64],
+            ),
+        ]
+        for label, size, stride, var_ranges, index, expected in cases:
+            with self.subTest(label):
+                cx = compute_coordinates(size, stride, var_ranges, index)
+                self.assertEqual(cx, expected)
+
+    def test_decompose_constant_offset_unpeelable_falls_back(self):
+        # remaining != 0 after peeling every dim -> return False, untouched.
+        coordinates = [sympy.S.Zero, sympy.S.Zero]
+        handled = _decompose_constant_offset(
+            sympy.Integer(1), [10, 10], [200, 2], coordinates
+        )
+        self.assertFalse(handled)
+        self.assertEqual(coordinates, [sympy.S.Zero, sympy.S.Zero])
+
+    def test_decompose_constant_offset_rejects_symbolic_offset(self):
+        # A genuinely symbolic offset can't be compared against a concrete
+        # stride, so this raises rather than silently mis-peeling -- which is
+        # why compute_coordinates guards this call with `not offset.free_symbols`.
+        s0 = sympy.Symbol("s0", integer=True, nonnegative=True)
+        with self.assertRaises(TypeError):
+            _decompose_constant_offset(
+                s0, [10, 10], [200, 2], [sympy.S.Zero, sympy.S.Zero]
+            )
 
 
 class TestUnrepresentableStickCandidates(TestCase):
@@ -351,6 +490,61 @@ class TestTilingExprToDeviceExpr(TestCase):
         index = p0
         result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
         self.assertEqual(result, p0)
+
+
+class TestFindAltTargetStlBoolStickSize(TestCase):
+    """_find_alt_target_stl must size a bool mutation target's stick from its
+    real physical format (target_stl.device_dtype), not target_layout.dtype's
+    hardcoded SEN169_FP16 assumption -- a bool held in IEEE_FP32 has a 32-elem
+    stick, not 64. Both cases below write host_size [64, 128] at column
+    offset 32 (a ``mask[:, 32:64].copy_(upd)``-style mutation): offset 32 is a
+    whole stick for IEEE_FP32 (32) but not for SEN169_FP16 (64), so the same
+    logical write must be treated differently depending on physical format.
+
+    This is a pure layout-resolution test: it calls _find_alt_target_stl
+    directly with hand-built layout objects, so it never reaches torch.compile
+    or the hardware compiler. That matters because an actual compiled
+    mutation into an IEEE_FP32-backed bool currently fails end-to-end on two
+    unrelated, lower-level gaps (ReStickifyOpHBM rejects IEEE_FP32 outright --
+    see test_restickify_fp32_unsupported_xfail in test_inductor_ops.py -- and
+    separately the DL op scheduler finds no candidate for a fused copy/slice
+    into IEEE_FP32). Neither gap is specific to this stick-size computation,
+    so this test isolates the one thing this fix actually changes.
+    """
+
+    def _write_dep(self):
+        # mask[:, 32:64].copy_(upd) over a [64, 128] host tensor: offset 32
+        # into the row-major index 128*d0 + d1.
+        d0, d1 = sympy.symbols("d0 d1", integer=True, nonnegative=True)
+        return MemoryDep("mask_buf", 128 * d0 + d1 + 32, (d0, d1), (64, 32))
+
+    def test_fp32_backed_bool_offset_is_stick_aligned(self):
+        # Pre-fix, get_elem_in_stick(target_layout.dtype) would use bool's
+        # hardcoded SEN169_FP16 stick (64) here regardless of target_stl,
+        # wrongly conclude offset 32 is not stick-aligned, and search for an
+        # alt layout. The fix resolves the real IEEE_FP32 stick (32), under
+        # which offset 32 is already aligned, so no alt is needed.
+        target_layout = FixedLayout(
+            torch.device("cpu"), torch.bool, [64, 128], [128, 1]
+        )
+        target_stl = SpyreTensorLayout([64, 128], torch.float32)
+        self.assertEqual(target_stl.device_dtype, DataFormats.IEEE_FP32)
+        self.assertIsNone(
+            _find_alt_target_stl(target_layout, target_stl, self._write_dep())
+        )
+
+    def test_fp16_backed_bool_offset_needs_alt(self):
+        # Contrast case: for a bool actually backed by SEN169_FP16, stick=64
+        # is correct, and offset 32 genuinely is not stick-aligned -- an alt
+        # stick dim is required, same as the pre-fix code would have found.
+        target_layout = FixedLayout(
+            torch.device("cpu"), torch.bool, [64, 128], [128, 1]
+        )
+        target_stl = SpyreTensorLayout([64, 128], torch.float16)
+        self.assertEqual(target_stl.device_dtype, DataFormats.SEN169_FP16)
+        self.assertIsNotNone(
+            _find_alt_target_stl(target_layout, target_stl, self._write_dep())
+        )
 
 
 class TestNormalizeCoordinatesFusion(TestCase):

@@ -46,6 +46,22 @@ on:
           and build the current nightly (same as the scheduled cron run).
         required: false
         type: string
+      run_torch_spyre_tests:
+        description: >-
+          Also run torch-spyre's own test suite (tests/) against the built
+          PyTorch commit, in addition to the upstream-beta suites. Manual
+          dispatch only; non-blocking (does not fail this run).
+        required: false
+        type: boolean
+        default: false
+      torch_spyre_test_type:
+        description: >-
+          Suite subset for the torch-spyre test run when
+          run_torch_spyre_tests is enabled: smoke | unit | integration |
+          regression | trunk | suite_<group> | <label>.
+        required: false
+        type: string
+        default: regression
 
 
 concurrency:
@@ -56,8 +72,9 @@ concurrency:
 
 permissions:
   contents: read
-  # Needed for OIDC when doing CRCR HUD reporting
-  # logic in build_test_pytorch_source.yaml is commented for now.
+  # Needed to mint the OIDC tokens used by:
+  #  - the pytorch/pytorch CRCR relay callbacks in build_test_pytorch_source.yaml
+  #  - the RHEL CI Results Relay callback in report_to_rhel_relay below
   id-token: write
 
 jobs:
@@ -68,9 +85,8 @@ jobs:
     if: github.event_name == 'repository_dispatch'
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     timeout-minutes: 10
 
     env:
@@ -94,7 +110,14 @@ jobs:
           printf '%s' "$PAYLOAD_JSON" > payload.json
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Setup venv
         run: |
@@ -108,6 +131,7 @@ jobs:
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
 
       - name: Classify dispatch and ingest into ClickHouse
+        continue-on-error: true
         run: |
           source .venv/bin/activate
           python3 .github/scripts/ingest_pytorch_dispatch.py \
@@ -131,9 +155,8 @@ jobs:
     name: Gate on merged PR to main, extract build SHA
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     outputs:
       pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
       should_build: ${{ steps.extract.outputs.should_build }}
@@ -274,10 +297,18 @@ jobs:
 
       - name: Install uv
         if: steps.extract.outputs.should_build == 'false'
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # latest-known, not "latest": it resolves to the newest uv whose checksum is
+          # bundled INTO this setup-uv pin, resolved locally with no release lookup. A
+          # just-published release is not yet mirrored on releases.astral.sh, so "latest"
+          # 404s there and falls back to GitHub Releases, which rate-limits (429) once the
+          # fleet requests it concurrently. Bumping setup-uv moves this version forward.
+          version: latest-known
 
       - name: Record gate rejection in ClickHouse
         if: steps.extract.outputs.should_build == 'false'
+        continue-on-error: true
         run: |
           uv run --with clickhouse-connect --with regex \
             .github/scripts/ingest_pytorch_dispatch.py \
@@ -296,3 +327,7 @@ jobs:
     secrets: inherit
     with:
       pytorch_sha: ${{ needs.gate_and_build.outputs.pytorch_sha }}
+      # Manual-dispatch-only opt-in -- empty/false on schedule and
+      # repository_dispatch triggers, which have no workflow_dispatch inputs.
+      run_torch_spyre_tests: ${{ github.event.inputs.run_torch_spyre_tests == 'true' }}
+      torch_spyre_test_type: ${{ github.event.inputs.torch_spyre_test_type || 'regression' }}
