@@ -135,7 +135,14 @@ class TestLxContextSwitching(unittest.TestCase):
         global _launch, _inner_fn, _inner_arg
 
         _inner_fn = torch.compile(lambda t: t * 2.0 + 1.0, dynamic=False)
-        _inner_arg = torch.ones(64, 64, dtype=DTYPE, device=DEVICE)
+        # 256x256, not 64x64: the nested launch's own LX planning starts fresh
+        # from address 0, independent of the outer graph's placement, so `r`
+        # is only actually at risk if the nested launch's LX footprint is big
+        # enough to reach r's offset. Empirically, 64x64 and 128x128 never
+        # overlap it (this canary silently stopped reproducing after #5fdd1f08
+        # made ExternKernel-adjacent buffers ineligible for LX elsewhere in
+        # the graph, shifting r's offset); 256x256 reliably does.
+        _inner_arg = torch.ones(256, 256, dtype=DTYPE, device=DEVICE)
         _launch = True
         _inner_fn(_inner_arg)  # compile + warm before the outer program runs
         _launch = False
