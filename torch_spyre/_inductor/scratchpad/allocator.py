@@ -98,9 +98,6 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.loop_info import CarriedReductionRecord
-from torch_spyre._inductor.scratchpad.lx_context_switching import (
-    LxContextSwitchingPass,
-)
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
@@ -2423,6 +2420,12 @@ def select_allocator() -> ScratchpadAllocator:
     # call with per-buffer dump/restore instead). Both are gated by the same
     # flag -- see the matching comments on _extern_kernel_in_live_range's two
     # call sites -- so this list is empty exactly when that guard is active.
+    # Imported locally: lx_context_switching imports ScratchpadOptimizationPass
+    # from this module, so a top-level import here would be circular.
+    from torch_spyre._inductor.scratchpad.lx_context_switching import (
+        LxContextSwitchingPass,
+    )
+
     post_optimization_passes: list[ScratchpadOptimizationPass] = (
         [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
     )

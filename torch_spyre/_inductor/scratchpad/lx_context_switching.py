@@ -45,8 +45,8 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import copy_op_metadata
+from torch_spyre._inductor.scratchpad.allocator import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
-from torch_spyre._inductor.scratchpad.passes import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 from torch_spyre.ops.fallbacks import fallback_ops
 
