@@ -43,7 +43,7 @@ from torch._inductor.lowering import clone as clone_lowering
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.pass_utils import copy_op_metadata
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
@@ -51,11 +51,6 @@ from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 from torch_spyre.ops.fallbacks import fallback_ops
 
 logger = get_inductor_logger("lx_context_switching")
-
-# Same op kind recompiled across many graphs (or many multi-output call sites
-# in one graph) would otherwise repeat an unchanging message once per
-# occurrence; warn only the first time a given op name is skipped this way.
-_warned_multi_output_ops: set[str] = set()
 
 
 def mark_lx_safe(
@@ -163,13 +158,13 @@ def _select_bracket_targets(
                 if op.op_overload is not None
                 else type(op).__name__
             )
-            if op_kind not in _warned_multi_output_ops:
-                _warned_multi_output_ops.add(op_kind)
-                logger.warning(
-                    "lx context switching: skipping multi-output FallbackKernel "
-                    "%s (not yet supported)",
-                    op_kind,
-                )
+            warn_once(
+                logger,
+                op_kind,
+                "lx context switching: skipping multi-output FallbackKernel "
+                "%s (not yet supported)",
+                op_kind,
+            )
             continue
 
         op_overload = op.op_overload
