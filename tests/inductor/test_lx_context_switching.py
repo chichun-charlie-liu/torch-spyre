@@ -33,6 +33,7 @@ TestMarkLxSafe/TestIsCpuOnlyFallback cover the Layer-1 helpers directly and
 need no compile or device.
 """
 
+import functools
 import unittest
 from unittest.mock import patch
 
@@ -101,12 +102,19 @@ if not _ns_has_op("test_lx_context_switching", "opaque_clone"):
     _LIB._register_fake("opaque_clone", lambda x: torch.empty_like(x))
 
 
-def _model(x, ws):
+def _model(x, ws, read_count=1):
     h = x
     for w in ws:
         r = h * 1.5 + 0.25  # live across the opaque op, at risk if LX-resident
         o = torch.ops.test_lx_context_switching.opaque_clone(h @ w)
-        h = r + o
+        # read_count separate reads of r, not r*read_count -- calculate_liveness
+        # (scratchpad/utils.py) counts distinct *operations* touching a buffer,
+        # so folding read_count into one op (e.g. scaling r) would still count
+        # as a single read; each += below is its own op in graph.operations,
+        # straddling the opaque call same as the read_count=1 case.
+        h = o
+        for _ in range(read_count):
+            h = h + r
     return h
 
 
@@ -131,7 +139,7 @@ class TestLxContextSwitching(unittest.TestCase):
         self._caches_disabled.__exit__(None, None, None)
         torch.compiler.reset()
 
-    def _run_launch_diff(self, layers: int, n: int) -> float:
+    def _run_launch_diff(self, layers: int, n: int, read_count: int = 1) -> float:
         global _launch, _inner_fn, _inner_arg
 
         _inner_fn = torch.compile(lambda t: t * 2.0 + 1.0, dynamic=False)
@@ -153,7 +161,9 @@ class TestLxContextSwitching(unittest.TestCase):
             for _ in range(layers)
         ]
 
-        compiled = torch.compile(_model, dynamic=False)
+        compiled = torch.compile(
+            functools.partial(_model, read_count=read_count), dynamic=False
+        )
         without = compiled(x, ws).to("cpu").float()
         _launch = True
         with_launch = compiled(x, ws).to("cpu").float()
@@ -192,6 +202,51 @@ class TestLxContextSwitching(unittest.TestCase):
         with ts_inductor_config.patch({"enable_lx_context_switching": True}):
             diff = self._run_launch_diff(layers=1, n=128)
         self.assertEqual(diff, 0.0)
+
+    def test_correct_at_higher_read_count(self):
+        """Both mechanisms stay correct as read_count grows past the
+        docs/benchmark table's read_count=1 -- only the *cost* story
+        (dump/restore's fixed 2*size/BW vs. the guard's (1+read_count)*size/BW,
+        scratchpad_planning.md's "LX context switching" section) is supposed
+        to depend on read_count, not correctness. The canary (neither
+        mechanism) is included for contrast: unprotected corruption grows
+        with read_count too (each extra read of the clobbered buffer
+        compounds into the output), which is expected and not itself a bug --
+        see test_neither_mechanism_reproduces_the_bug for that mechanism on
+        its own."""
+        for read_count in (2, 4):
+            with self.subTest(read_count=read_count):
+                # _run_launch_diff doesn't reset dynamo/inductor state itself
+                # (only setUp/tearDown do, once per test *method*) -- the
+                # three separate test_*_is_correct methods each get that reset
+                # for free between them, but three _run_launch_diff calls in
+                # one method/subTest do not, so it is done explicitly here.
+                # Skipping this makes the canary silently stop reproducing
+                # (state left over from the guard/context-switching runs
+                # above changes where `r` lands in LX).
+                torch.compiler.reset()
+                with ts_inductor_config.patch({"enable_lx_context_switching": False}):
+                    guard_diff = self._run_launch_diff(
+                        layers=1, n=128, read_count=read_count
+                    )
+                self.assertEqual(guard_diff, 0.0)
+
+                torch.compiler.reset()
+                with ts_inductor_config.patch({"enable_lx_context_switching": True}):
+                    ctx_switch_diff = self._run_launch_diff(
+                        layers=1, n=128, read_count=read_count
+                    )
+                self.assertEqual(ctx_switch_diff, 0.0)
+
+                torch.compiler.reset()
+                with (
+                    ts_inductor_config.patch({"enable_lx_context_switching": False}),
+                    _pr3683_guard_disabled(),
+                ):
+                    canary_diff = self._run_launch_diff(
+                        layers=1, n=128, read_count=read_count
+                    )
+                self.assertGreater(canary_diff, 0.0)
 
 
 class TestMarkLxSafe(unittest.TestCase):
