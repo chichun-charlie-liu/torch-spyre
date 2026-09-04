@@ -578,6 +578,14 @@ which chooses the core divisions and LX placements jointly in one
 constraint model. It falls back to the greedy allocator when `ortools`
 is unavailable.
 
+### Joint SA co-optimization
+
+Setting `layout_solver = "simulated_annealing"` together with
+`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
+driven by `SaCoOptimizingSolver`, which anneals the division vector and the
+layout permutation as one joint state and scores it with the cost model. See
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## LX context switching
 
 LX data corruption (clobbering) can happen when two conditions hold together: (1) two
@@ -637,13 +645,6 @@ and `LxContextSwitchingPass` is registered as a `post_optimization_pass` instead
 guard runs exactly as PR3683 shipped it and the new pass is never registered. It is a real
 either/or, not a partial toggle, so old and new behavior stay directly comparable while the new
 mechanism earns trust in production; removing the guard entirely is a follow-up once it does.
-### Joint SA co-optimization
-
-Setting `layout_solver = "simulated_annealing"` together with
-`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
-driven by `SaCoOptimizingSolver`, which anneals the division vector and the
-layout permutation as one joint state and scores it with the cost model. See
-[Joint core-division + LX placement](sa_co_optimization.md).
 
 ## Current limitations
 
