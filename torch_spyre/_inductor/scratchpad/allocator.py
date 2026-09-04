@@ -518,8 +518,9 @@ class ScratchpadAllocator:
         # lifetime.  The general mutation gate remains unchanged otherwise.
         if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
-            # compute_ops.py's is_tiled_lx check), so a buffer whose address
-            # advances per coarse-tile iteration must stay in HBM, where that is
+            # compute_ops.py's generate_sdsc, which raises NotImplementedError via
+            # _tensor_tiled_by_symbol for exactly this case), so a buffer whose
+            # address advances per coarse-tile iteration must stay in HBM, where that is
             # supported -- whether the advance is on this buffer's own write
             # (_is_tiled_advancing) or on some other op's read of it
             # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer

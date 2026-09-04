@@ -52,6 +52,11 @@ from torch_spyre.ops.fallbacks import fallback_ops
 
 logger = get_inductor_logger("lx_context_switching")
 
+# Same op kind recompiled across many graphs (or many multi-output call sites
+# in one graph) would otherwise repeat an unchanging message once per
+# occurrence; warn only the first time a given op name is skipped this way.
+_warned_multi_output_ops: set[str] = set()
+
 
 def mark_lx_safe(
     op: "torch._ops.OpOverload | torch._library.custom_ops.CustomOpDef",
@@ -149,11 +154,22 @@ def _select_bracket_targets(
             continue
         outputs = getattr(op, "outputs", None)
         if outputs is None or len(outputs) > 1:
-            logger.warning(
-                "lx context switching: skipping multi-output FallbackKernel "
-                "%s (not yet supported)",
-                op.get_operation_name(),
+            # Dedupe by op kind (op_overload when available, else the
+            # Operation subclass), not op.get_operation_name() -- that is a
+            # per-instance buffer name (e.g. "buf42"), unique to this graph,
+            # so it would never actually suppress repeats across compiles.
+            op_kind = (
+                repr(op.op_overload)
+                if op.op_overload is not None
+                else type(op).__name__
             )
+            if op_kind not in _warned_multi_output_ops:
+                _warned_multi_output_ops.add(op_kind)
+                logger.warning(
+                    "lx context switching: skipping multi-output FallbackKernel "
+                    "%s (not yet supported)",
+                    op_kind,
+                )
             continue
 
         op_overload = op.op_overload

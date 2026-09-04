@@ -1037,6 +1037,8 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
-mark_lx_safe(torch.ops.spyre.max_dim_int64_fallback.default)
-mark_lx_safe(torch.ops.spyre.min_dim_int64_fallback.default)
-mark_lx_safe(torch.ops.spyre.max_default_int64_fallback.default)
+# max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
+# registered via ops/fallbacks.py's register_fallback, which already appends
+# them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)
+# catches them without help. Marking them here too would be redundant, not
+# wrong; leave them off so this list stays a signal for ops that need it.
