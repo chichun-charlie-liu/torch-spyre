@@ -162,7 +162,8 @@ def _select_bracket_targets(
                 logger,
                 op_kind,
                 "lx context switching: skipping multi-output FallbackKernel "
-                "%s (not yet supported)",
+                "%s (not yet supported). If you need this supported, please "
+                "file an issue and tag @chichun-charlie-liu.",
                 op_kind,
             )
             continue
