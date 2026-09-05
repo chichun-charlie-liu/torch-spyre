@@ -33,7 +33,6 @@ TestMarkLxSafe/TestIsCpuOnlyFallback cover the Layer-1 helpers directly and
 need no compile or device.
 """
 
-import functools
 import unittest
 from unittest.mock import patch
 
@@ -161,12 +160,10 @@ class TestLxContextSwitching(unittest.TestCase):
             for _ in range(layers)
         ]
 
-        compiled = torch.compile(
-            functools.partial(_model, read_count=read_count), dynamic=False
-        )
-        without = compiled(x, ws).to("cpu").float()
+        compiled = torch.compile(_model, dynamic=False)
+        without = compiled(x, ws, read_count).to("cpu").float()
         _launch = True
-        with_launch = compiled(x, ws).to("cpu").float()
+        with_launch = compiled(x, ws, read_count).to("cpu").float()
         _launch = False
 
         return (with_launch - without).abs().max().item()
