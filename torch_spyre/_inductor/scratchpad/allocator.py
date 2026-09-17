@@ -2548,6 +2548,18 @@ def select_allocator() -> ScratchpadAllocator:
         LxContextSwitchingPass,
     )
 
+    # InsertGatherClonePass clones a gathered matmul operand (paged
+    # attention's query-row gather) with a device layout matching its
+    # consumer's already-committed division. Imported locally for the same
+    # reason as LxContextSwitchingPass above: it imports
+    # ScratchpadOptimizationPass from this module. Unlike
+    # LxContextSwitchingPass, this runs *before* the solve (it inserts a
+    # buffer for the solver to evaluate like any other), not after.
+    from torch_spyre._inductor.insert_gather_clone import InsertGatherClonePass
+
+    pre_optimization_passes: list[ScratchpadOptimizationPass] = (
+        [InsertGatherClonePass()] if config.enable_gather_clone else []
+    )
     post_optimization_passes: list[ScratchpadOptimizationPass] = (
         [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
     )
@@ -2560,7 +2572,9 @@ def select_allocator() -> ScratchpadAllocator:
             )
         if config.layout_solver == "simulated_annealing":
             return CoOptimizingAllocator(
-                layout_planning=SaCoOptimizingSolver, size=size
+                layout_planning=SaCoOptimizingSolver,
+                size=size,
+                pre_optimization_passes=pre_optimization_passes,
             )
         # Throwaway empty-buffer probe: cheap (no real solving happens in
         # __init__) and the only way to know whether this factory's solver is
@@ -2573,6 +2587,7 @@ def select_allocator() -> ScratchpadAllocator:
                 ),
                 size=size,
                 prune=True,
+                pre_optimization_passes=pre_optimization_passes,
                 post_optimization_passes=post_optimization_passes,
             )
         # The isinstance check above just proved this factory's solver is a
@@ -2580,12 +2595,14 @@ def select_allocator() -> ScratchpadAllocator:
         return CoOptimizingAllocator(
             layout_planning=cast(CoreDivisionSolverFactory, solver_cls),
             size=size,
+            pre_optimization_passes=pre_optimization_passes,
             post_optimization_passes=post_optimization_passes,
         )
 
     return ScratchpadAllocator(
         layout_planning=solver_cls,
         size=size,
+        pre_optimization_passes=pre_optimization_passes,
         post_optimization_passes=post_optimization_passes,
     )
 

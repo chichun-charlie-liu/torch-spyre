@@ -42,6 +42,16 @@ enable_lx_context_switching: bool = os.getenv(
     "yes",
 )
 
+# Clone a gathered matmul operand (e.g. paged attention's query-row gather)
+# with a shape/layout/work-division matching its consumer's, so it can be
+# placed in LX like any other buffer -- see insert_gather_clone.py. Defaults
+# on; set ENABLE_GATHER_CLONE=0 to disable for debugging/bisection.
+enable_gather_clone: bool = os.getenv("ENABLE_GATHER_CLONE", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # Select who allocates the HBM pool for an SDSC bundle's intermediates:
 # False (default) has the backend self-allocate via
 # sdscbundle.device_mem_allocate, exactly matching pre-existing behavior.
