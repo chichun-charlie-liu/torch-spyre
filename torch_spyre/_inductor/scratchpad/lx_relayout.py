@@ -60,7 +60,12 @@ from ..pass_utils import (
     op_read_writes,
     try_device_coordinates,
 )
-from .utils import _op_num_cores
+from .utils import (
+    _TEMP_BAR_GATHERS_FROM_LX_ENABLED,
+    _op_num_cores,
+    _reads_gather_output,
+    is_gather_op,
+)
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -942,6 +947,19 @@ def collect_lx_relayout_plans(
         # Activation eligibility belongs to the producer, not to an individual
         # edge. Never relayout a restickified graph input or weight.
         if not _is_activation_source(graph, operations, producer):
+            continue
+
+        # TEMP: TORCH_SPYRE_BAR_GATHERS_FROM_LX=1 (see scratchpad/utils.py)
+        # also closes this path: a gather -- or K's restickify/V's
+        # broadcast-identity, which read a gather's output as their sole
+        # operand (`_reads_gather_output`) -- proposed here as a relayout
+        # source is a "planned" buffer, which bypasses `OP_OUTPUT_NOT_GOOD_
+        # FOR_LX_REUSE` entirely (`allocator.py`'s own `_op_output_good_
+        # for_lx_reuse` comment: "A planned source intentionally bypasses
+        # the profitability denylist"). Remove once that round is done.
+        if _TEMP_BAR_GATHERS_FROM_LX_ENABLED and (
+            is_gather_op(producer) or _reads_gather_output(producer, graph)
+        ):
             continue
 
         producer_coordinates = try_device_coordinates(

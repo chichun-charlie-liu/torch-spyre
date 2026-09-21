@@ -14,6 +14,7 @@
 
 
 import math
+import os
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -47,12 +48,101 @@ from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 # stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
 # its output is pinned to LX; see the direct-lowering codegen follow-up
 # tracked from PR #3284.
-OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
-    {
-        "convolution",
-        "conv2d",
-    }
+# TEMP: TORCH_SPYRE_BAR_GATHERS_FROM_LX=1 additionally bars index_select
+# ("aten.index_select.default") and index ("aten.index.Tensor") outputs --
+# i.e. every plain gather -- from LX, for a matmul-work-division experiment
+# that wants every one of Q/K/V's gathers on HBM uniformly (no LX-placement
+# confound between columns). `_get_op_name`'s short-name resolution
+# (`op_short_name`, `pass_utils.py`) confirmed empirically: `torch.ops.aten.
+# index_select.default._opname == "index_select"`, `torch.ops.aten.index.
+# Tensor._opname == "index"`. `_TEMP_BAR_GATHERS_FROM_LX_ENABLED` is also
+# imported by `lx_relayout.py` to close the one escape hatch this denylist
+# alone doesn't cover (a gather already proposed as a relayout-plan source
+# bypasses this denylist entirely -- see the comment there). Remove this
+# toggle (both files) once that round of experiments is done.
+_TEMP_BAR_GATHERS_FROM_LX_ENABLED = (
+    os.environ.get("TORCH_SPYRE_BAR_GATHERS_FROM_LX") == "1"
 )
+_TEMP_BAR_GATHERS_FROM_LX = frozenset(
+    {"index_select", "index"} if _TEMP_BAR_GATHERS_FROM_LX_ENABLED else ()
+)
+
+OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = (
+    frozenset(
+        {
+            "convolution",
+            "conv2d",
+        }
+    )
+    | _TEMP_BAR_GATHERS_FROM_LX
+)
+
+# TEMP: TORCH_SPYRE_BAR_BROADCAST_GATHER=1 extends `_restickify_barrier`'s
+# existing gather bar (`scratchpad/allocator.py`) to also cover a gather
+# feeding a plain broadcast-identity reader (V's query-group expand), not
+# just a genuine restickify (K's case, already barred unconditionally). The
+# reasoning mirrors the restickify case exactly: a gather feeding an op
+# that re-materializes it wholesale has no reuse to offer its own LX copy.
+# This exact idea was tried once before ("v16", pre-row-major-pull,
+# pre-Q-head-split) and measured as a regression there; re-testing under
+# the current best setting (post-row-major, Q head-split, T/8,Hnum/4
+# confounded) since the earlier measurement predates several since-changed
+# factors. Remove this toggle once that round of experiments is done.
+_TEMP_BAR_BROADCAST_GATHER_ENABLED = (
+    os.environ.get("TORCH_SPYRE_BAR_BROADCAST_GATHER") == "1"
+)
+
+# FX origin targets of a plain gather (index_select/index.Tensor). See
+# is_gather_op.
+_GATHER_ORIGIN_TARGETS = frozenset({"aten.index.Tensor", "aten.index_select.default"})
+
+
+def is_gather_op(op: Any) -> bool:
+    """True if op's origin is a plain gather (index_select/index.Tensor).
+
+    Used by `_restickify_barrier`: a gather feeding a restickify has no
+    reuse to offer LX residency. The restickify re-materializes it in a
+    different physical layout regardless of where it read from, so the
+    gather's own LX copy is read exactly once and then dead -- pure
+    overhead, not the read/write savings LX residency exists for.
+    """
+    origins = getattr(op, "origins", None) or ()
+    return any(
+        str(getattr(n, "target", None)) in _GATHER_ORIGIN_TARGETS for n in origins
+    )
+
+
+# TEMP: see _TEMP_BAR_GATHERS_FROM_LX_ENABLED above. Remove alongside it.
+def _reads_gather_output(op: Any, graph: Any) -> bool:
+    """True if op's sole non-indirect tensor read is the output of a plain
+    gather (`is_gather_op`).
+
+    Identifies K's restickify and V's broadcast-identity in the paged-
+    attention benchmark `TORCH_SPYRE_BAR_GATHERS_FROM_LX` was built for:
+    both read their respective K/V gather's output as their only real
+    operand. Barring the raw gather alone (`OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE`)
+    leaves these downstream buffers independently eligible for LX, since
+    neither resolves to an "index_select"/"index" op name -- both fuse to
+    `aten.clone.default` (`"clone"`), confirmed via direct SDSC
+    `debug_handle_.aten_op` inspection. This predicate closes that gap by
+    identity (reads a gather's output), not by op name.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    reads = op_read_writes(op).reads
+    names = {
+        dep.name
+        for dep in reads
+        if isinstance(dep, MemoryDep) and not dep.is_indirect()
+    }
+    if len(names) != 1:
+        return False
+    (name,) = names
+    producer = next(
+        (o for o in graph.operations if o.get_name() == name),
+        None,
+    )
+    return producer is not None and is_gather_op(producer)
 
 
 def round_up_to_alignment(arg: int, alignment: int) -> int:

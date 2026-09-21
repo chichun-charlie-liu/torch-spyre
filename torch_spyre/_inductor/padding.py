@@ -531,6 +531,45 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
     return is_restickify_coords(in_coords, out_coords)
 
 
+def is_broadcast_identity_op(op: Operation, graph: GraphLowering) -> bool:
+    """Return whether ``op`` is a plain broadcast: a single-input pointwise
+    copy between two FixedTiledLayouts whose output has strictly more
+    elements than its input (e.g. V's query-group broadcast-expand).
+
+    Deliberately a coarser test than a restickify's own (``is_restickify_
+    op``'s coordinate-order check): a restickify preserves element count
+    (a stick-placement change, not a replication), so ``out_elems >
+    in_elems`` already excludes it without needing stride-level detail.
+    Used only to *bar* a gather from LX residency (see ``_restickify_
+    barrier``, ``scratchpad/allocator.py``) -- a false positive here costs
+    a missed optimization, never a wrong value, so this stays intentionally
+    conservative rather than reusing the widen pass's stricter, position-
+    aware ``_detect_broadcast_axis`` (``insert_gather_clone.py``, not
+    imported here to avoid a module cycle with ``scratchpad.allocator``).
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return False
+    if not isinstance(op.data, Pointwise):
+        return False
+
+    in_dep, in_buf, _in_layout = _restickify_input(op, graph)
+    if in_dep is None or not isinstance(in_buf, ComputedBuffer):
+        return False
+    if not isinstance(in_buf.data, Pointwise):
+        return False
+
+    out_elems = 1
+    for r in op.data.ranges:
+        out_elems *= int(concretize_expr(r))
+    in_elems = 1
+    for r in in_buf.data.ranges:
+        in_elems *= int(concretize_expr(r))
+    return out_elems > in_elems
+
+
 def _pad_device_dim(
     layout: FixedTiledLayout,
     device_dim: int,

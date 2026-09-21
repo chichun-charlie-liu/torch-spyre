@@ -99,6 +99,10 @@ from torch_spyre._inductor.scratchpad.utils import (
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
     counted_loop_lifetime_end_overrides,
+    is_gather_op,
+    _TEMP_BAR_GATHERS_FROM_LX_ENABLED,
+    _TEMP_BAR_BROADCAST_GATHER_ENABLED,
+    _reads_gather_output,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
@@ -106,7 +110,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.loop_info import CarriedReductionRecord, LoopCarryRecord
-from torch_spyre._inductor.padding import is_restickify_op
+from torch_spyre._inductor.padding import is_restickify_op, is_broadcast_identity_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
     collect_lx_relayout_plans,
@@ -467,7 +471,10 @@ class ScratchpadAllocator:
         return op_short_name(op)
 
     def _op_output_good_for_lx_reuse(
-        self, op: Any, planned_lx_buffers: frozenset[str] = frozenset()
+        self,
+        op: Any,
+        planned_lx_buffers: frozenset[str] = frozenset(),
+        graph: Optional[GraphLowering] = None,
     ) -> bool:
         if not isinstance(op, ComputedBuffer):
             return False
@@ -476,6 +483,19 @@ class ScratchpadAllocator:
         # A CPU-resident ComputedBuffer has a plain FixedLayout
         # with no device_layout and can never be LX-pinned.
         if not isinstance(op.layout, FixedTiledLayout):
+            return False
+        # TEMP: TORCH_SPYRE_BAR_GATHERS_FROM_LX=1 -- hard bar, ahead of every
+        # other check below (including the "planned source" bypass): K's
+        # restickify and V's broadcast-identity both read a gather's output
+        # as their sole operand but don't resolve to an "index_select"/
+        # "index" op name themselves, so the denylist below never catches
+        # them. See `_reads_gather_output` (scratchpad/utils.py). Remove
+        # once that round of experiments is done.
+        if (
+            _TEMP_BAR_GATHERS_FROM_LX_ENABLED
+            and graph is not None
+            and _reads_gather_output(op, graph)
+        ):
             return False
         # A planned source intentionally bypasses the profitability denylist:
         # the relayout planner has already applied its stricter structural gates.
@@ -570,7 +590,9 @@ class ScratchpadAllocator:
             buf_user_deps: every buffer's ``(op, dep)`` users, from
                 :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
-        if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
+        if op is None or not self._op_output_good_for_lx_reuse(
+            op, planned_lx_buffers, graph=graph
+        ):
             return "op not allowed"
         if not hasattr(getattr(op, "layout", None), "device_layout"):
             # No device layout => no computable footprint (e.g. a
@@ -814,8 +836,42 @@ class ScratchpadAllocator:
             if graph.operations[u].name != name
             and is_restickify_op(graph.operations[u], graph)
         ]
+        # TEMP: TORCH_SPYRE_BAR_BROADCAST_GATHER=1 (see scratchpad/utils.py)
+        # extends the "gather has no reuse to offer" reasoning below to a
+        # gather feeding a plain broadcast-identity reader (V's
+        # query-group expand), not just a genuine restickify (K's case).
+        # This reasoning is generic to "wholesale re-materialized
+        # elsewhere", so it's checked independently of `readers` and does
+        # NOT feed the restickify-specific cross-frame/core-local logic
+        # further below, which stays scoped to genuine restickify readers.
+        if _TEMP_BAR_BROADCAST_GATHER_ENABLED and not readers:
+            broadcast_readers = [
+                graph.operations[u]
+                for u in uses
+                if graph.operations[u].name != name
+                and is_broadcast_identity_op(graph.operations[u], graph)
+            ]
+            if broadcast_readers:
+                producer = next(
+                    (op for op in graph.operations if op.get_name() == name), None
+                )
+                if producer is not None and is_gather_op(producer):
+                    return "read by broadcast (gather has no reuse to offer)"
         if not readers:
             return None
+        producer = next((op for op in graph.operations if op.get_name() == name), None)
+        if producer is not None and is_gather_op(producer):
+            # A gather has no reuse to offer a restickify reader: the
+            # restickify re-materializes it in a different physical layout
+            # regardless, so the gather's own LX copy is read exactly once
+            # and then dead -- pure overhead, not the savings LX residency
+            # exists for. Bar it unconditionally, bypassing the local-read
+            # escape hatch below: that proof only establishes the read is
+            # *safe*, not that paying for residency (and, when the gather's
+            # own view disagrees with the restickify's, an extra relayout
+            # shuffle) is worth it. Left unguarded, this was observed to
+            # starve other, genuinely-reused buffers of LX capacity.
+            return "read by restickify (gather has no reuse to offer)"
         if not config.lx_planner_relayout:
             return "read by restickify (cross-frame barrier)"
         if all(

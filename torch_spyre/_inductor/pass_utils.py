@@ -1661,6 +1661,41 @@ def shared_indirect_data_syms(op: "ComputedBuffer") -> set[Symbol]:
     return syms
 
 
+def indirect_hint_only_safe_syms(op: "ComputedBuffer") -> set[Symbol]:
+    """TEMP (gather_to_lx experiment): symbols ``shared_indirect_data_syms``
+    forbids that are safe to allow via an *explicit user ``work_div`` hint*
+    specifically -- not a general relaxation.
+
+    A coordinate with no ``IndirectAccess`` anywhere in it at all is a
+    plain, ordinary affine expression: its device dimension was never
+    combined with the runtime-chosen row's, so splitting it carries none
+    of the #3984 folding risk ``_non_indirect_coord_syms`` protects
+    against, and needs no per-core address that depends on the runtime
+    index. Deliberately NOT folded into ``shared_indirect_data_syms``
+    itself: that function also feeds the automatic (unhinted) division
+    search's candidate-factor pruning, and relaxing it there changed the
+    *unhinted* default division chosen for an unrelated op (confirmed
+    empirically against the no-hint baseline in EXPERIMENTS_SUMMARY.md --
+    a real, unintended behavior change, not just a hint-validation one).
+    This helper is consulted only from ``_apply_user_hint``'s legality
+    check, so it can never change anything the automatic search does.
+    Remove this, or promote it out of TEMP status, once that document's
+    verification is done.
+    """
+    safe: set[Symbol] = set()
+    risky: set[Symbol] = set()
+    for coords in _shared_indirect_coords(op):
+        for coord in coords:
+            if hasattr(coord, "has") and coord.has(IndirectAccess):
+                inner: set[Symbol] = set()
+                for term in coord.atoms(IndirectAccess):
+                    inner |= term.free_symbols
+                risky |= coord.free_symbols - inner
+            else:
+                safe |= coord.free_symbols
+    return safe - risky
+
+
 def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
     """Iteration dims that must not be core-split for an indirect op.
 
