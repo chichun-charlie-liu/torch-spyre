@@ -60,6 +60,7 @@ from .pass_utils import (
     device_coordinates,
     finite_upper_or_none,
     get_mem_deps_from_rw,
+    indirect_hint_only_safe_syms,
     input_layout_for_operation,
     iteration_space_from_op,
     commit_iteration_space_ownership,
@@ -1087,6 +1088,11 @@ def _apply_user_hint(
     splits: dict[Symbol, int] = {}
     cores_used = 1
     loop_var_dims = getattr(op, "work_div_loop_info", {})
+    # TEMP (gather_to_lx experiment): computed lazily, only if some hinted
+    # sym is actually restricted to {1} -- see indirect_hint_only_safe_syms's
+    # own docstring for why this is scoped to explicit user hints only, never
+    # touching allowed_splits itself. Remove once experiment is done.
+    _hint_safe_syms: set[Symbol] | None = None
     for sym, split_val in user_splits.items():
         # bool is an int subclass in Python, but it is not a meaningful split.
         if isinstance(split_val, bool) or not isinstance(split_val, (int, Integer)):
@@ -1110,10 +1116,23 @@ def _apply_user_hint(
                 f"work_division_hint: {op_name} cannot split constrained dim {sym}."
             )
         if sym in allowed_splits and split not in allowed_splits[sym]:
-            raise Unsupported(
-                f"work_division_hint: {op_name} dim {sym} legal splits are "
-                f"{sorted(allowed_splits[sym])}."
-            )
+            # TEMP (gather_to_lx experiment): a {1}-only restriction that
+            # comes from a provably clean (non-#3984) shared-indirect
+            # coordinate is safe to bypass for an explicit hint -- but only
+            # bypass the *raise*, not the remaining checks below (max_cores,
+            # divisibility) that still have to run normally. See
+            # indirect_hint_only_safe_syms's docstring. Remove once
+            # experiment is done.
+            _bypass = False
+            if allowed_splits[sym] == frozenset({1}):
+                if _hint_safe_syms is None:
+                    _hint_safe_syms = indirect_hint_only_safe_syms(op)
+                _bypass = sym in _hint_safe_syms
+            if not _bypass:
+                raise Unsupported(
+                    f"work_division_hint: {op_name} dim {sym} legal splits are "
+                    f"{sorted(allowed_splits[sym])}."
+                )
         if split < min_splits.get(sym, 1):
             raise Unsupported(
                 f"work_division_hint: {op_name} dim {sym} must split at least "
@@ -1159,10 +1178,19 @@ def _apply_user_hint(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
+    # TEMP (gather_to_lx experiment): mirror the same bypass here -- this is
+    # a defensive re-check of the same allowed_splits domains the per-sym
+    # loop above already cleared via indirect_hint_only_safe_syms. Remove
+    # once experiment is done.
     conflicting_domains = {
         sym: allowed
         for sym, allowed in allowed_splits.items()
         if splits.get(sym, 1) not in allowed
+        and not (
+            allowed == frozenset({1})
+            and _hint_safe_syms is not None
+            and sym in _hint_safe_syms
+        )
     }
     below_span_floor = {
         sym: minimum
