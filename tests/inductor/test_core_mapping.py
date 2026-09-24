@@ -1064,6 +1064,310 @@ def test_direct_axis_proof_budget_boundary():
     assert prove(8, 2, sympy.Mod(point, 4), 8, 2).startswith("ownership mismatch:")
 
 
+def test_factor_single_device_axis_accepts_unique_divisible_axis():
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    # h=512 matches no stride directly (cheap dict lookup would miss), but
+    # axis 0's stride 128 divides it (k=4) and device_size[0]=32 == k*extent
+    # (extent=8, the loop symbol's full range -- not k*split). The axis's own
+    # coordinate must carry k as its coefficient (4*sym): device_coordinates
+    # are real device-axis units, and a step of sym is k of them wide.
+    result = factor(
+        512,
+        2,
+        [128, 64, 1],
+        [32, 4, 64],
+        (),
+        (4 * sym, sympy.S.Zero, sympy.S.Zero),
+        sym,
+        8,
+        rejection_reasons=reasons,
+    )
+    assert result == (0, 2)
+    assert not reasons
+
+
+def test_factor_single_device_axis_rejects_claimed_axis():
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    result = factor(
+        512,
+        2,
+        [128, 64, 1],
+        [32, 4, 64],
+        (0,),
+        (4 * sym, sympy.S.Zero, sympy.S.Zero),
+        sym,
+        8,
+        rejection_reasons=reasons,
+    )
+    assert result is None
+    assert any("already claimed" in reason for reason in reasons)
+
+
+def test_factor_single_device_axis_rejects_final_stick_dimension():
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    # Only the last axis (stride 1, the within-stick axis) matches here;
+    # factor_single_device_axis itself has no stick-boundary opinion -- the
+    # caller in pass_utils.py is responsible for rejecting axis == len-1.
+    result = factor(
+        1,
+        64,
+        [128, 64, 1],
+        [8, 4, 64],
+        (),
+        (sympy.S.Zero, sympy.S.Zero, sym),
+        sym,
+        64,
+        rejection_reasons=reasons,
+    )
+    assert result == (2, 64)
+
+
+def test_factor_single_device_axis_accepts_outer_stick_dim():
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    # Generalizes the narrow multi-stick-stride rescue (pass_utils.py's
+    # num_stick_dim-only special case): axis 0 is the outer-stick dim here
+    # (stride 64 == elems_per_stick), h=128 -> k=2, extent=split=3 so
+    # device_size[0]=k*extent=6; the axis's own coordinate carries k (2*sym).
+    result = factor(
+        128,
+        3,
+        [64, 1],
+        [6, 64],
+        (),
+        (2 * sym, sympy.S.Zero),
+        sym,
+        3,
+        rejection_reasons=reasons,
+    )
+    assert result == (0, 3)
+    assert not reasons
+
+
+def test_factor_single_device_axis_rejects_ambiguous_or_missing_axis():
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    # No axis stride divides h=3 evenly (1 does trivially, but 3 % (1*2)!=0
+    # against device_size[2]=64) or gives an exact k*split match elsewhere.
+    result = factor(
+        3,
+        2,
+        [128, 64, 1],
+        [8, 4, 64],
+        (),
+        (sym, sympy.S.Zero, sympy.S.Zero),
+        sym,
+        8,
+        rejection_reasons=reasons,
+    )
+    assert result is None
+    assert any("no unique single-axis factoring" in reason for reason in reasons)
+
+
+def test_factor_single_device_axis_extent_wider_than_split():
+    """Regression: a split narrower than the driving symbol's own extent.
+
+    Real kernel case (page_attn_head_major_prefill's Q gather vs. its
+    matmul's ``Hkv`` split): the loop symbol's range (8, ``Hkv``) is wider
+    than the requested split (4) -- each of the 4 partitions spans 2
+    symbol-steps, not 1. The axis match must be against ``k * extent``
+    (4*8=32, the axis's true size), not ``k * split`` (4*4=16) -- the latter
+    would incorrectly reject this axis (device_size[0] is really 32). The
+    returned split factor is still 4 (the real core-partition count), not
+    16 -- k is a device-unit-width detail used only to locate/prove the
+    axis, never folded into the returned split.
+    """
+    factor = core_mapping_module.factor_single_device_axis
+    sym = sympy.Symbol("sym")
+    reasons: list[str] = []
+    result = factor(
+        512,
+        4,
+        [128, 64, 4096, 1],
+        [32, 2, 512, 64],
+        (),
+        (4 * sym, sympy.S.Zero, sympy.S.Zero, sympy.S.Zero),
+        sym,
+        8,
+        rejection_reasons=reasons,
+    )
+    assert result == (0, 4)
+    assert not reasons
+
+
+def test_factor_single_device_axis_accepts_untouched_fused_symbol():
+    """Real kernel case: two loop symbols fused onto one physical axis.
+
+    ``page_attn_head_major_prefill``'s Q gather (``buf0``) has axis-0
+    coordinate ``4*d0 + d1`` where ``d0`` (``Hkv``, extent 8) is the symbol
+    being split by 4, and ``d1`` (``Hq_kv``, extent 4) rides along
+    untouched. Each ``Hkv``-step is 4 device-units wide (``k=4``) and
+    ``Hq_kv``'s own extent is exactly 4, so ``d1`` always contributes a
+    value in [0, k) that tiles one whole step with no gaps or overlap --
+    safe to prove even though ``d1`` is never substituted to a concrete
+    point. The returned split is still 4 (the real core-partition count
+    ``d0`` creates), not 16: ``k`` locates/proves the axis but must never
+    inflate the returned split, or ``work_slice_dims`` (and thus
+    ``math.prod`` over it) would overcount cores by a factor of k.
+    """
+    factor = core_mapping_module.factor_single_device_axis
+    d0 = sympy.Symbol("d0")
+    d1 = sympy.Symbol("d1")
+    reasons: list[str] = []
+    result = factor(
+        512,
+        4,
+        [128, 64, 4096, 1],
+        [32, 2, 512, 64],
+        (),
+        (4 * d0 + d1, sympy.S.Zero, sympy.S.Zero, sympy.S.Zero),
+        d0,
+        8,
+        other_extents={d1: 4},
+        other_splits={d0: 4, d1: 1},
+        rejection_reasons=reasons,
+    )
+    assert result == (0, 4)
+    assert not reasons
+
+
+def test_factor_single_device_axis_rejects_fused_symbol_that_is_split():
+    """The untouched-fused-symbol rescue must not fire if that symbol is
+    itself split by another dimension -- it would no longer ride along
+    whole, and could straddle a partition boundary."""
+    factor = core_mapping_module.factor_single_device_axis
+    d0 = sympy.Symbol("d0")
+    d1 = sympy.Symbol("d1")
+    reasons: list[str] = []
+    result = factor(
+        512,
+        4,
+        [128, 64, 4096, 1],
+        [32, 2, 512, 64],
+        (),
+        (4 * d0 + d1, sympy.S.Zero, sympy.S.Zero, sympy.S.Zero),
+        d0,
+        8,
+        other_extents={d1: 4},
+        other_splits={d0: 4, d1: 2},
+        rejection_reasons=reasons,
+    )
+    assert result is None
+    assert reasons
+
+
+def test_factor_single_device_axis_rejects_fused_symbol_wrong_extent():
+    """The untouched-fused-symbol rescue must not fire if that symbol's own
+    extent doesn't equal k exactly -- it would either leave a gap or
+    straddle a partition boundary."""
+    factor = core_mapping_module.factor_single_device_axis
+    d0 = sympy.Symbol("d0")
+    d1 = sympy.Symbol("d1")
+    reasons: list[str] = []
+    result = factor(
+        512,
+        4,
+        [128, 64, 4096, 1],
+        [32, 2, 512, 64],
+        (),
+        (4 * d0 + d1, sympy.S.Zero, sympy.S.Zero, sympy.S.Zero),
+        d0,
+        8,
+        other_extents={d1: 3},
+        other_splits={d0: 4, d1: 1},
+        rejection_reasons=reasons,
+    )
+    assert result is None
+    assert reasons
+
+
+def test_per_core_view_places_single_axis_factored_split(monkeypatch):
+    """sym's extent (8) is wider than its split (2): k=4 device-units per
+    sym-step, device_size[0]=32=k*extent. work_slice_dims must store the
+    real core-partition count (2), not k*split (8) -- the axis truly has
+    only 2 distinct core-owned regions here, matching what
+    ``_op_num_cores``-style ``math.prod`` accounting expects elsewhere."""
+    sym = sympy.Symbol("sym")
+    prep = _view_prep(
+        iter_space={sym: 8},
+        write_index=512 * sym,
+        dep_coeff={sym: 512},
+        dep_device_coordinates=(4 * sym, sympy.S.Zero, sympy.S.Zero),
+        device_size=[32, 4, 64],
+        stride_map=[128, 64, 1],
+        device_stride_to_dim={128: 0, 64: 1, 1: 2},
+    )
+    # Not gated behind lx_planner_relayout: the single-axis path reuses the
+    # always-on cheap path's own proof, unlike the fused multi-axis search.
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", False)
+    view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, {sym: 2}
+    )
+    assert representable
+    assert not partial
+    assert view.work_slice_dims == ((0, 2),)
+
+
+def test_per_core_view_still_rejects_fused_axis_without_single_axis_match(
+    monkeypatch,
+):
+    """Regression: the existing driven==2 fused-path case is untouched.
+
+    Its stride (``h``) divides no single existing axis exactly the way the
+    new path requires, so it must still fall through unchanged to
+    ``decompose_fused_split_view``.
+    """
+    fused = sympy.Symbol("fused")
+    prep = _view_prep(
+        iter_space={fused: 32},
+        write_index=fused,
+        dep_coeff={fused: 1},
+        dep_device_coordinates=(
+            sympy.floor(fused / 8),
+            sympy.Mod(fused, 8),
+            sympy.S.Zero,
+        ),
+        device_size=[4, 8, 1],
+        stride_map=[-1, -1, 1],
+        device_stride_to_dim={},
+        elems_per_stick=1,
+    )
+
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", False)
+    disabled_view, disabled_partial, disabled_representable = (
+        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+    )
+    assert not disabled_representable
+    assert not disabled_partial
+    assert not disabled_view.work_slice_dims
+
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
+    enabled_view, enabled_partial, enabled_representable = (
+        pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
+    )
+    assert enabled_representable
+    assert not enabled_partial
+    assert enabled_view.work_slice_dims == ((0, 4), (1, 8))
+    assert enabled_view.same_partition(
+        PerCoreView(
+            ((0, 4), (1, 8)),
+            (
+                (0, sympy.floor(sympy.Symbol("core_id") / 8)),
+                (1, sympy.Mod(sympy.Symbol("core_id"), 8)),
+            ),
+            num_cores=32,
+        )
+    )
+
+
 def test_prepare_per_core_view_does_not_record_repeat_info():
     head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
     prior = sympy.Symbol("prior")

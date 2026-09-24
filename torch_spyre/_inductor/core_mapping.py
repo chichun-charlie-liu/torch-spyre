@@ -275,6 +275,126 @@ def direct_axis_ownership_failure(
         return f"unsupported ownership evaluation: {type(exc).__name__}: {exc}"
 
 
+def factor_single_device_axis(
+    host_stride: int,
+    split: int,
+    stride_map: Sequence[int],
+    device_size: Sequence[int],
+    claimed_dims: Sequence[int],
+    device_coordinates: Sequence[Expr],
+    coordinate_symbol: Symbol,
+    extent: int,
+    *,
+    other_extents: "dict[Symbol, int] | None" = None,
+    other_splits: "dict[Symbol, int] | None" = None,
+    rejection_reasons: list[str] | None = None,
+) -> tuple[int, int] | None:
+    """Factor one existing, unclaimed device axis into ``(axis, split)``.
+
+    Handles the case ``decompose_fused_split_view`` cannot: a loop split whose
+    coordinate drives exactly one existing device axis (``driven == 1``),
+    below that function's 2-axis fan-out floor. Finds the unique axis whose
+    stride divides ``host_stride`` evenly and whose size is exactly tiled by
+    ``split`` at that stride, then reuses ``direct_axis_ownership_failure``
+    for the actual containment proof — no new proof primitive.
+
+    Returns the same ``split`` the caller passed in, not scaled by ``k``
+    (the axis's device-unit-per-step width): ``split`` is the number of
+    distinct core-partitions this loop symbol creates, which is what
+    ``work_slice_dims`` must store (``PerCoreView``'s split factor is a core
+    count, consumed via ``math.prod`` elsewhere). ``k`` only matters for
+    locating the axis and proving containment against its true physical
+    size; folding it into the returned split would double-count device-unit
+    width as extra cores.
+
+    The axis may be fused from more than one loop symbol (e.g. a reshape's
+    ``Hkv``/``Hq_kv`` pair sharing one physical head axis): ``other_extents``
+    and ``other_splits`` describe every other free symbol on this axis's
+    coordinate, keyed by symbol. Each must be untouched by any split
+    (``other_splits[sym] == 1``) and its own iteration extent must equal
+    exactly ``k`` (the split symbol's per-step device-unit width) -- the
+    condition under which that symbol rides along whole, tiling one full,
+    contiguous step with no gaps or overlap, so the proof can substitute it
+    away rather than leave it free.
+    """
+
+    def reject(reason: str) -> None:
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+
+    if split <= 0:
+        reject("unsupported single-axis factor input: split must be positive")
+        return None
+    other_extents = other_extents or {}
+    other_splits = other_splits or {}
+    candidates = []
+    for axis, stride in enumerate(stride_map):
+        if stride <= 0 or host_stride % stride:
+            continue
+        k = host_stride // stride
+        # device_size[axis] must equal exactly k * extent, not k * split: the loop symbol
+        # (range `extent`) walks the *entire* physical axis, not just `split`-many steps of
+        # it -- a step's own device-unit width is k, so k * extent is the axis's true size
+        # when this symbol is really what drives it (rejecting the axis otherwise, rather
+        # than silently proving containment against a too-small slice of it).
+        if k <= 0 or device_size[axis] != k * extent:
+            continue
+        axis_symbols = device_coordinates[axis].free_symbols - {coordinate_symbol}
+        if not axis_symbols:
+            candidates.append((axis, k, axis_symbols))
+            continue
+        if any(other_splits.get(sym, 1) != 1 for sym in axis_symbols):
+            continue
+        residual_extent = 1
+        for sym in axis_symbols:
+            if sym not in other_extents:
+                break
+            residual_extent *= other_extents[sym]
+        else:
+            if residual_extent != k:
+                continue
+            candidates.append((axis, k, axis_symbols))
+    if len(candidates) != 1:
+        reject(
+            f"no unique single-axis factoring: host_stride={host_stride} "
+            f"split={split} stride_map={list(stride_map)} device_size="
+            f"{list(device_size)} matched {len(candidates)} axes"
+        )
+        return None
+    axis, k, axis_symbols = candidates[0]
+    if axis in claimed_dims:
+        reject(f"cannot factor device axis {axis}: already claimed by another split")
+        return None
+    # `split` is the number of distinct core-partitions this loop symbol
+    # creates along this axis -- the quantity work_slice_dims stores (see
+    # PerCoreView's docstring: "how many distinct cores own distinct slices
+    # along that dim"). `k` is a device-address-space detail (how many
+    # physical device units one partition spans, since a fused sibling
+    # symbol or a coarser device-unit width may live on this axis too) and
+    # must not be folded into the returned split factor -- doing so double-
+    # counts those units as extra cores when the caller takes
+    # math.prod(work_slice_dims) to get a physical core count.
+    # Every other symbol on this axis rides along whole, contiguously filling
+    # one full step (just proved: its combined extent equals k exactly) --
+    # substitute it to a fixed representative point (0) rather than leave it
+    # free, since it never affects which step (and thus which partition) a
+    # given coordinate_symbol value lands in.
+    coordinate = device_coordinates[axis].xreplace(
+        {coordinate_symbol: _LOOP_POINT, **{sym: 0 for sym in axis_symbols}}
+    )
+    reason = direct_axis_ownership_failure(
+        extent,
+        split,
+        coordinate,
+        device_size[axis],
+        split,
+    )
+    if reason:
+        reject(f"cannot prove single-axis factoring of device axis {axis}: {reason}")
+        return None
+    return axis, split
+
+
 def decompose_fused_split_view(
     fused_symbol: Symbol,
     fused_split: int,

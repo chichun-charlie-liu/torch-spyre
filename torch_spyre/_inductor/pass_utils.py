@@ -3549,7 +3549,49 @@ def _per_core_view_from_prep(
         ):
             decomposed = None
             decomposition_reasons: list[str] = []
-            if config.lx_planner_relayout:
+            # No existing device axis has this split's exact stride. Before
+            # falling to the multi-axis fan-out search below, try factoring one
+            # existing, unclaimed axis directly -- the single-axis case that
+            # search structurally cannot handle (its own driven-axis floor is 2).
+            if dev_dim is None:
+                from .core_mapping import factor_single_device_axis
+
+                single_axis_extent = iter_space[sym]
+                if isinstance(single_axis_extent, tuple):
+                    single_axis_extent = single_axis_extent[0]
+                single_axis_extent = concretize_expr(single_axis_extent)
+                other_extents: dict[sympy.Symbol, int] = {}
+                for other_sym, other_extent in iter_space.items():
+                    if other_sym is sym:
+                        continue
+                    if isinstance(other_extent, tuple):
+                        other_extent = other_extent[0]
+                    other_extents[other_sym] = concretize_expr(other_extent)
+                factored = factor_single_device_axis(
+                    h,
+                    split,
+                    stride_map,
+                    device_size,
+                    tuple(work_slice_dims),
+                    prep.dep_device_coordinates,
+                    sym,
+                    single_axis_extent,
+                    other_extents=other_extents,
+                    other_splits=per_sym,
+                    rejection_reasons=decomposition_reasons,
+                )
+                if factored is not None:
+                    factored_axis, factored_split = factored
+                    if factored_axis == len(device_size) - 1:
+                        decomposition_reasons.append(
+                            "cannot emit: single-axis factoring splits the "
+                            "final stick dimension"
+                        )
+                    else:
+                        work_slice_dims[factored_axis] = factored_split
+                        sym_to_device_dim[sym] = factored_axis
+                        continue
+            if dev_dim is None and config.lx_planner_relayout:
                 mapping = iteration_core_to_slot()
                 loop_extents = {
                     dim: extent[0] if isinstance(extent, tuple) else extent
