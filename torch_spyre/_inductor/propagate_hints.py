@@ -210,9 +210,7 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
             if not _is_hop_subgraph_getattr(node):
                 continue
             sub_gm = getattr(graph.owning_module, node.target)
-            sub_snapshot = _snapshot_subgraph(sub_gm)
-            if any(custom for _, custom in sub_snapshot):
-                subgraph_snapshots.append(sub_snapshot)
+            subgraph_snapshots.append(_snapshot_subgraph(sub_gm))
         graph.owning_module.meta["__spyre_dim_hints_subgraphs"] = subgraph_snapshots
 
 
@@ -336,6 +334,11 @@ def _recover_hop_subgraph_hints(
     subgraph corresponds to the Nth scan-combine-fn subgraph collect_spyre_hints
     snapshotted (verified empirically across 1-3 scan sites, including with
     the two name orders scrambled relative to each other).
+
+    collect_spyre_hints snapshots every scan, hinted or not, so this
+    positional pairing holds even when only some scans in the graph carry a
+    hint -- filtering unhinted ones out there would desync every later index
+    against ``body_nodes`` below, which always has one entry per scan.
     """
     if not subgraph_snapshots:
         return
@@ -357,14 +360,16 @@ def _recover_hop_subgraph_hints(
     if len(body_nodes) != len(subgraph_snapshots):
         logger.debug(
             "recover_spyre_hints: found %d while_loop body subgraph(s) but "
-            "collected %d hinted scan-combine-fn snapshot(s); skipping "
-            "subgraph hint recovery (mismatched count).",
+            "collected %d scan-combine-fn snapshot(s); skipping subgraph "
+            "hint recovery (mismatched count).",
             len(body_nodes),
             len(subgraph_snapshots),
         )
         return
 
     for body_node, snapshot in zip(body_nodes, subgraph_snapshots):
+        if not any(custom for _, custom in snapshot):
+            continue
         sub_gm = getattr(graph.owning_module, body_node.target)
         nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
         matched, hinted = _apply_snapshot(nodes, snapshot)

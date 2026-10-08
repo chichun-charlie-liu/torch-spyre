@@ -5015,5 +5015,69 @@ class TestHoistedInputCloneOnRealGraph(unittest.TestCase):
         self.assertTrue(readers)
 
 
+class TestRecoverSpyreHints(unittest.TestCase):
+    """collect_spyre_hints/recover_spyre_hints: scan<->while_loop_body hint
+    recovery through decompose_scan_to_while_loop's retrace.
+    """
+
+    def test_one_unhinted_scan_does_not_block_the_other(self):
+        """Two sibling for_each_tile scans (paged_gather_kv_fn's K/V-page
+        gather + Q@K^T, P@V shape, matching spyre-inference's real
+        page_attn_head_major_prefill_kernel block_body); only the second
+        carries a spyre_hint.
+
+        Pins cyang49's PR #5057 review blocker: collect_spyre_hints used to
+        skip snapshotting a scan with no hint, which desynced the positional
+        pairing recover_spyre_hints relies on against `body_nodes` (always
+        one entry per scan) -- so the one unhinted sibling scan here used to
+        make recovery skip the *other*, hinted scan's body too, not just its
+        own. collect_spyre_hints must snapshot every scan unconditionally for
+        this pairing to hold.
+        """
+        import torch_spyre  # noqa: F401  registers the "spyre" device
+        from torch_spyre.constants import DEVICE_NAME
+
+        from for_each_tile_fixtures import (
+            paged_gather_kv_inputs,
+            paged_gather_kv_one_hinted_fn,
+        )
+
+        k_pages, v_pages, table, q = paged_gather_kv_inputs()
+        k_pages = k_pages.to(DEVICE_NAME)
+        v_pages = v_pages.to(DEVICE_NAME)
+        table = table.to(DEVICE_NAME)
+        q = q.to(DEVICE_NAME)
+
+        _out, gm = capture_post_grad_while_loop(
+            paged_gather_kv_one_hinted_fn, (k_pages, v_pages, table, q)
+        )
+
+        body_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "get_attr" and "while_loop_body_graph" in n.target
+        ]
+        self.assertEqual(len(body_nodes), 2, "expected one body per scan site")
+
+        hinted_counts = []
+        for body_node in body_nodes:
+            sub_gm = getattr(gm, body_node.target)
+            hinted = [
+                n
+                for n in sub_gm.graph.nodes
+                if n.op == "call_function" and n.meta.get("custom")
+            ]
+            hinted_counts.append(len(hinted))
+
+        self.assertEqual(
+            sorted(hinted_counts),
+            [0, 3 + 4],
+            "exactly one scan's body should recover hinted nodes (the "
+            "gather+squeeze pair x2, the transpose+mm pair, and the final "
+            "mm): the unhinted sibling must stay empty, not suppress "
+            "recovery for the hinted one",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
