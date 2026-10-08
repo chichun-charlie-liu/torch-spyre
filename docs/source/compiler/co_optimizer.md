@@ -290,34 +290,56 @@ run is represented and survives scheduling and codegen — is implemented and do
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-**Status: in progress, in both solvers, not yet on `main`.** The apply-side plumbing is
-landed — `scratchpad/coarse_tiling.py` takes a `TileSpec` and lowers it to `DimHint`s, and
-`CoreDivision.tiling` / `min_footprint` in `plan_solver.py` already account for a tiling if one
-is present. But automatic, solver-chosen coarse tiling (as opposed to tiling driven by explicit
-`for_each_tile`/hint-based code) is still landing:
+**Status: landed for CP-SAT, still in progress for simulated annealing.** The apply-side
+plumbing is landed for both solvers — `scratchpad/coarse_tiling.py` takes a `TileSpec` and
+lowers it to `DimHint`s, and `CoreDivision.tiling` / `min_footprint` in `plan_solver.py`
+already account for a tiling if one is present:
 
-- **CP-SAT**: a stacked pair of PRs (`pr-4767`, prediction; `pr-4768`, integration) adds a
-  `predict_frame` dry-run (`wsr/tile_prediction.py`) that computes what a candidate tiling
-  would produce without mutating IR, and extends `ilp_solver_ortools.py` with a 5-stage
-  lexicographic objective (residency, then cut count, then parallelism, then division shape,
-  then tile count) once tiling candidates are in play. Neither file exists in this form on
-  `main` yet.
-- **Simulated annealing**: a 7-PR stack (`pr-4456` through `pr-4894`) extends
+- **CP-SAT**: landed via `#4768` (`main` as of this update). `config.auto_coarse_tiling`
+  (env `AUTO_COARSE_TILING=1`, off by default) lets the joint CP-SAT solve choose a coarse
+  tiling for each op alongside its core division; it has no effect with any other solver.
+
+  - **Candidates.** An op is offered the output-axis tilings `enumerate_tile_options` finds:
+    never the stick dim, never a reduction axis, never an axis one of its reads repeats along
+    (the repeated dim of `x.repeat`, whose tiles would have to wrap back over `x`), and none
+    that leave a per-core read over the read-distance limit. Ops a `spyre_hint` or
+    `for_each_tile` loop already tiles, every op inside a `for_each_tile` region, restickifies
+    and mutations are offered only the untiled option. Each tiling gets its own division menu,
+    enumerated on the per-tile frame.
+  - **Matching.** A producer/consumer pair of divisions is compatible when the two agree on
+    core ownership and on tile ownership of the buffer they share, both taken on the untiled
+    buffer: tile `t` must touch the same slice on both sides. `TileSpec` equality is not the
+    test — `host_dim` is positional in each op's own output, so equal specs can tile different
+    dims of a shared buffer (a permuted or reducing consumer), and unequal specs the same one.
+    A consumer that reads the buffer more than once has to agree through every read: `a +
+    a.permute(1, 0, 2)` pairs with `a` only under a division or tiling on a dim both reads walk
+    alike. A buffer that may not live in LX gets no compatible pairs; tiling exists to keep
+    buffers in LX, so its producer and consumer never share a nest.
+  - **Loop groups.** Consecutive ops that run the same loop nest (the same trip count at each
+    level) share a loop group. The solve requires every producer/consumer edge inside a group
+    to be a compatible pair, and `CoarseTilingPass` checks each such edge again before applying
+    the tiling.
+  - **Objective.** The cost expression itself is not used, since it has no term for tile size
+    or loop-group boundaries — the solve instead ranks plans lexicographically: LX residency,
+    then *cuts* (tiled ops whose value must be copied out of their nest, for a consumer outside
+    it or as a graph output), then parallelism, division shape, and last, fewest tiles.
+  - **Materialize and re-plan.** When the solve picks any tiling, `CoarseTilingPass` applies it
+    and the allocation is solved again over the tiled graph with no further tilings offered;
+    that second plan is the one committed. A `SolveError` from the first solve falls back to
+    greedy placement over the untouched graph, and one from the second solve over the tiled
+    graph.
+
+- **Simulated annealing**: still landing. A 7-PR stack (`pr-4456` through `pr-4894`) extends
   `SaCoOptimizingSolver`'s division representation to carry a tiling choice and extends the
   **recolor** move to propose tiling changes, with companion-buffer copy-out costs (for data
   that escapes a tile run) priced into the cost model along the way. `main`'s
   `sa_cooptimizer.py` does not yet carry this.
 
-Both tracks gate the same join: a buffer's `min_footprint` already has a `/ tile_count` term
-waiting to be driven by a real search instead of staying at the untiled default, and both
-tracks share a real file-level conflict surface (`plan_solver.py`, `allocator.py`,
-`config.py`, the `wsr/` tiling helpers) that whichever lands second will need to rebase
-through non-mechanically.
-
-This matches what the existing docs say about the gap:
-`scratchpad_planning.md`'s "Current limitations" lists "No coarse-tiling integration" and its
-"Future work" lists "Joint operation with the `coarse_tiling` pass" — both still accurate as
-of this draft.
+`scratchpad_planning.md`'s "Current limitations" still lists "No coarse-tiling integration"
+and its "Future work" still lists "Joint operation with the `coarse_tiling` pass" — both now
+stale given CP-SAT's landing (`#4768` added the "Solver-driven coarse tiling" section without
+removing them), worth flagging to whoever maintains that page rather than silently
+contradicting it here.
 
 ## Cost model
 
@@ -463,16 +485,17 @@ loud warning instead of a quietly wrong measurement.
   decision, re-derive what coverage and weighting the model actually *needs* — per
   category, per shape range, per core count — and check the plan against that, rather than
   assuming today's distribution reflects anyone's intent.
-- **New co-optimized axes need their own sweep configs, deliberately added.** Landing
-  coarse tiling's solver-chosen search (the CP-SAT `predict_frame`/`pr-4767`/`pr-4768` and
-  SA `pr-4456` through `pr-4894` stacks described above) will not automatically get swept: checked
-  directly against those branches, none of them touch `profile_ops.py`,
-  `tools/cost_model/sweep_plan.json`, or `eval_model.py` — the new tiling-candidate
-  machinery has no sweep knob of its own yet, the same way `WD_M`/`WD_N`/`WD_K` is `mmwd`'s
-  knob for forced work-division splits today. Combined with the point above (no automatic
-  coverage check), a new optimization axis landing without a deliberate sweep-plan update
-  is a real way for that axis's prediction accuracy to go unmeasured indefinitely rather
-  than loudly missing.
+- **New co-optimized axes need their own sweep configs, deliberately added.** CP-SAT's
+  solver-chosen coarse tiling (`#4768`, `config.auto_coarse_tiling`, described above) landed
+  without one: checked directly against the landed commit, it touches neither `profile_ops.py`,
+  `tools/cost_model/sweep_plan.json`, nor `eval_model.py` — the new tiling-candidate machinery
+  has no sweep knob of its own yet, the same way `WD_M`/`WD_N`/`WD_K` is `mmwd`'s knob for
+  forced work-division splits today. Its prediction accuracy is therefore unmeasured right now,
+  not hypothetically — nothing in [Accuracy](cost_model.md#accuracy)'s table covers it. The
+  same gap is coming for simulated annealing's stack (`pr-4456` through `pr-4894`) once it
+  lands too. Combined with the point above (no automatic coverage check), a new optimization
+  axis landing without a deliberate sweep-plan update is a real way for its prediction accuracy
+  to go unmeasured indefinitely rather than loudly missing.
 - **Could the model tune itself?** Today, fitting is manual: someone reads
   `eval_model.py`'s RMS% table and `--plot` scatter, forms a hypothesis, edits a constant
   or term in `cost_model.py`, and re-scores. Every constant in `CostParams` already carries
@@ -508,9 +531,11 @@ loud warning instead of a quietly wrong measurement.
 
 Open items from drafting this page that are worth resolving before calling it done:
 
-- Confirm with whoever is driving the CP-SAT and SA coarse-tiling branches which PR stack is
-  expected to land first, and whether this page should wait for that merge or describe the
-  in-flight design now (as it does today) and get updated after.
+- CP-SAT's coarse-tiling stack landed first (`#4768`), updating [c) Coarse
+  tiling](#c-coarse-tiling) above accordingly. SA's stack (`pr-4456` through `pr-4894`) is
+  still pending — update that section again once it lands rather than leaving CP-SAT's
+  landed/SA's pending split stale the way `scratchpad_planning.md`'s own "Current
+  limitations"/"Future work" lists were left after `#4768` (flagged above).
 - The existing docs *and the current code* use "tiling" for at least two different things —
   `CoreDivision.tiling` (coarse tiling proper, a `TileSpec`), and, separately, (a)
   `scratchpad_planning.md`'s co-optimization section calling core-division splits for matmuls
