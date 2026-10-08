@@ -153,15 +153,41 @@ def log_new_nodes(node: torch.fx.Node):
     )
 
 
-def _is_hop_subgraph_getattr(node: torch.fx.Node) -> bool:
-    """Whether ``node`` is a ``get_attr`` referencing a traced subgraph, e.g.
-    ``scan``'s ``combine_fn`` (for_each_tile's HOP). ``while_loop``/``map``
-    bodies hinted directly are a future extension, not handled yet.
+def _scan_combine_subgraphs(graph: torch.fx.Graph) -> list[torch.fx.GraphModule]:
+    """``GraphModule``s referenced as a ``scan`` call's combine_fn in ``graph``, in
+    encounter order.
+
+    Matches on the ``scan`` HOP specifically (``torch.ops.higher_order.scan``), not on
+    "any get_attr whose target is a GraphModule": a graph can carry other GraphModule
+    subgraphs that are not scan combine functions and have no corresponding
+    ``while_loop_body_graph`` for recovery to pair against (e.g. a ``torch.cond``
+    branch left in the graph at collection time). Collecting those too would inflate
+    collect_spyre_hints's count past what _recover_hop_subgraph_hints's
+    while_loop_body_graph-only count can ever match, reintroducing the
+    mismatch-abandons-everything failure this guards against.
+
+    Only ``graph``'s own direct call_function nodes are considered -- a nested
+    for_each_tile's inner scan, reached through this scan's own combine_fn subgraph,
+    is not walked into here. Empirically (verified via a real nested-for_each_tile
+    compile, see TestRecoverSpyreHints.test_nested_scan_hint_recovers), by the time an
+    outer scan's combine_fn is snapshotted, Inductor has already fully decomposed any
+    inner scan reached through it into its own while_loop -- so there is no pending
+    inner scan subgraph left for this function to miss. If a future torch version
+    changes that ordering, re-verify against that test before assuming recursion is
+    needed here.
     """
-    if node.op != "get_attr":
-        return False
-    target = getattr(node.graph.owning_module, node.target, None)
-    return isinstance(target, torch.fx.GraphModule)
+    assert graph.owning_module is not None
+    subgraphs = []
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target is not torch.ops.higher_order.scan:
+            continue
+        combine_fn_node = node.args[0]
+        assert isinstance(combine_fn_node, torch.fx.Node) and combine_fn_node.op == (
+            "get_attr"
+        ), f"{node}: scan's first arg must be a get_attr node, got {combine_fn_node!r}"
+        sub_gm = getattr(graph.owning_module, combine_fn_node.target)
+        subgraphs.append(sub_gm)
+    return subgraphs
 
 
 def _snapshot_subgraph(sub_gm: torch.fx.GraphModule) -> list[tuple[Any, dict | None]]:
@@ -184,7 +210,7 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     the ``target`` OpOverload is preserved and is what we align on.
 
     Also snapshots every scan-combine-fn subgraph in encounter order (see
-    ``_is_hop_subgraph_getattr``): for_each_tile's body traces into its own
+    ``_scan_combine_subgraphs``): for_each_tile's body traces into its own
     ``GraphModule``, invisible to the flat walk above. ``decompose_scan_to_
     while_loop`` (later in post_grad_passes) replaces each ``scan`` with a
     freshly retraced ``while_loop`` whose body starts with no hint metadata --
@@ -205,12 +231,8 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
         ]
         graph.owning_module.meta["__spyre_dim_hints"] = snapshot
 
-        subgraph_snapshots = []
-        for node in graph.nodes:
-            if not _is_hop_subgraph_getattr(node):
-                continue
-            sub_gm = getattr(graph.owning_module, node.target)
-            subgraph_snapshots.append(_snapshot_subgraph(sub_gm))
+        scan_subgraphs = _scan_combine_subgraphs(graph)
+        subgraph_snapshots = [_snapshot_subgraph(sub_gm) for sub_gm in scan_subgraphs]
         graph.owning_module.meta["__spyre_dim_hints_subgraphs"] = subgraph_snapshots
 
 
