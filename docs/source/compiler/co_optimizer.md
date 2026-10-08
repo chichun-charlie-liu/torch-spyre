@@ -22,9 +22,8 @@ into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](wor
 - [Why a co-optimizer](#why-a-co-optimizer)
 - [How it works in general](#how-it-works-in-general)
 - [What gets co-optimized](#what-gets-co-optimized)
-  - [Scratchpad placement](#a-scratchpad-placement)
-  - [Work division](#b-work-division)
-  - [Coarse tiling](#c-coarse-tiling)
+  - [LX placement and work division](#a-lx-placement-and-work-division)
+  - [LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
 - [Cost model](#cost-model)
 - [Ongoing work](#ongoing-work)
 - [Related documents](#related-documents)
@@ -92,18 +91,14 @@ actually have a choice), and at each leaf:
 
 The combination with the lowest score wins; its divisions are committed to every buffer, and
 the wrapped solver runs once more to produce the final addresses.
-`TestExhaustiveSearchResidency.test_mismatched_consumer_spills_the_producer`
-(`tests/inductor/test_scratchpad_solver.py`) wires this up end to end — a three-buffer
-producer→consumer→sink chain, run through `ExhaustiveSearchSolver([producer, consumer, sink],
-inner_factory=GreedyLayoutSolver, ...)` — and shows the piece this page cares about: the
-`core_div_mismatch` check this solver runs is exactly the same `cd_parent_matches` relation
-the production solvers use to decide which combinations even make a buffer eligible for LX,
-not a check bolted on separately per solver. (In this particular fixture every buffer carries
-only one division candidate, so the exhaustive search has nothing left to search over — the
-test isolates the residency check alone — but any buffer with more than one candidate is
-exactly what the DFS loops over.) The real version of the search this page is building toward
-is the one in [Why a co-optimizer](#why-a-co-optimizer): several buffers each with a few
-divisions to choose from, where only some combinations avoid a mismatch.
+
+For example: a producer with 2 candidate divisions feeding a consumer with 2 of its own is a
+`2×2 = 4`-leaf DFS. Say only one of those four pairings avoids a `core_div_mismatch` between
+them (`cd_parent_matches` — the same relation the production solvers use to decide which
+combinations even make a buffer LX-eligible, not a check bolted on separately here). The three
+mismatched leaves each spill one buffer to HBM and score accordingly; the matching leaf scores
+zero (both pin). `ExhaustiveSearchSolver` tries all four, keeps the zero-scoring one, and
+commits its divisions.
 
 This also shows why it's not what ships by default: scoring a leaf means re-running the real
 placement solver from scratch, so the cost is exponential in the number of buffers with a
@@ -113,17 +108,18 @@ purpose-built core-division-capable solver to co-optimize with (i.e. anything ot
 `"cpsat"` with `ortools` installed, or `"simulated_annealing"`) — and only when the caller has
 opted in via `config.allow_exhaustive_search` (env `ALLOW_EXHAUSTIVE_SEARCH`); otherwise it
 raises rather than silently paying that cost. The two solvers below exist to make the general
-case affordable.
+case affordable for the common case; the rest of this section covers how the fallback itself
+is kept affordable when it does run.
 
-### Pruning the exhaustive search: `_enum_split_options`
-
-`select_allocator()` always pairs the `ExhaustiveSearchSolver` fallback above with
-`CoOptimizingAllocator(prune=True)`, which swaps the division menu it DFS-searches: instead of
-`enumerate_work_division_candidates()`'s full, standalone-work-division-planner cross product,
-`_enum_split_options` (`allocator.py`) builds a much smaller, heuristic candidate list per op,
-dispatching on op type. CP-SAT and SA never set `prune=True` — this path exists specifically to
-keep the exhaustive DFS's exponential cost affordable, not as a third solving strategy
-alongside them.
+**Pruning the DFS's candidate menu: `_enum_split_options`.** The example above assumed each
+buffer's menu was already small (2 candidates). In practice `select_allocator()` always pairs
+`ExhaustiveSearchSolver` with `CoOptimizingAllocator(prune=True)`, which controls exactly that
+menu: instead of `enumerate_work_division_candidates()`'s full, standalone-work-division-planner
+cross product, `_enum_split_options` (`allocator.py`) builds a much smaller, heuristic
+candidate list per op, dispatching on op type — the difference between a `2×2`-leaf DFS and
+one with every legal division for every buffer. CP-SAT and SA never set `prune=True` — this
+pruning exists specifically to keep *this* DFS's exponential cost affordable, not as a third
+solving strategy alongside them.
 
 :::{figure} ../_static/images/lx/co-optimization.svg
 :alt: Co-optimization searches over alternative split assignments, scoring each by HBM bytes left unpinned
@@ -231,54 +227,76 @@ divisions itself. The joint behavior is what `CoOptimizingAllocator` adds on top
 
 ## What gets co-optimized
 
-Three variables are, or are becoming, part of the joint search:
+**Controlling it**: two flags gate everything below, for both subsections.
 
-### a) Scratchpad placement
+- `config.co_optimizing_lx_planning` (env `CO_OPTIMIZING_LX_PLANNING`, **on** by default):
+  the on/off switch. Off, every variable here goes back to being decided by its own
+  standalone pass, nothing joint.
+- `config.layout_solver` (env `LAYOUT_SOLVER`, default `"cpsat"`): which solver runs the
+  joint search. Options are `"cpsat"`, `"simulated_annealing"`, `"greedy"`, `"firstfit"`, and
+  `"bestfit"` — but only `"simulated_annealing"`, and `"cpsat"` *with `ortools` installed*,
+  are natively core-division-capable and reach a purpose-built joint solver directly.
 
-**What it is**: where each buffer's resident copy lives in LX — represented as
-`address: Optional[int]` on `LifetimeBoundBuffer`; `None` after solving means the buffer
-spilled to HBM. Eligibility is decided once, declaratively, in
-`ScratchpadAllocator._residency_reasons`, and carried to every solver as a single
-`residency_reason` field (`None` = may be pinned, any string = may not) — see
-[Declarative exclusion](scratchpad_planning.md#declarative-exclusion). The actual placement
-search (which address, in what order) is `pi` in the SA solver and the 2D no-overlap packing
-in CP-SAT.
+Every other case — `"greedy"`, `"firstfit"`, `"bestfit"`, or `"cpsat"` without `ortools` —
+has no core-division-capable solver to co-optimize with, so `select_allocator()` **rejects it
+by default**: it raises `ValueError` unless `config.allow_exhaustive_search` (env
+`ALLOW_EXHAUSTIVE_SEARCH`) is also set, in which case it falls back to the
+`ExhaustiveSearchSolver` DFS from
+[The simplest version](#the-simplest-version-exhaustive-search-over-greedy-placement) above.
+So `layout_solver="greedy"` with `co_optimizing_lx_planning` left on doesn't just place
+buffers once `allow_exhaustive_search` is set — it drives that DFS over `greedy`'s own
+division menu. **That DFS is exponential** (`K^N` leaves over the `N` buffers with a real
+choice) **and has no size cap or timeout of its own** — the reject-by-default behavior above
+is the only guard, so only opt in on a task small enough that the exponential blow-up is
+acceptable, not as a general substitute for CP-SAT or SA.
 
-**Status**: implemented, and the variable the whole scratchpad-planning pass exists to solve.
-See [Scratchpad Planning](scratchpad_planning.md) for the full allocator architecture, and note
-that the standalone, placement-only `SimulatedAnnealingLayoutSolver`
-(see [Simulated Annealing Layout Planner](simulated_annealing_layout.md)) is a *different*
-class from the joint `SaCoOptimizingSolver` — it only ever moves `pi`, never the division
-vector `W`.
+### a) LX placement and work division
 
-### b) Work division
+**What it is**: this pair is the baseline joint search — neither variable alone is a
+"co-optimization" (that needs at least two things decided together), so this is the smallest
+real instance of what the rest of this page describes.
 
-**What it is**: how many cores an op's output or reduction uses, and which slice of the
-iteration space each core owns — one split factor per iteration-space symbol. Splitting an
-**output** dim gives each core a disjoint output slice; splitting a **reduction** dim gives
-each core a partial result that must be combined. See
-[Work Division Planning](work_division_planning.md) for the standalone 3-pass planner
-(span-reduction, cost-model matmul split, default distribution) that picks this when the
-co-optimizer isn't driving it.
+- **LX placement** is where each buffer's resident copy lives in LX — represented as
+  `address: Optional[int]` on `LifetimeBoundBuffer`; `None` after solving means the buffer
+  spilled to HBM. Eligibility is decided once, declaratively, in
+  `ScratchpadAllocator._residency_reasons`, and carried to every solver as a single
+  `residency_reason` field (`None` = may be pinned, any string = may not) — see
+  [Declarative exclusion](scratchpad_planning.md#declarative-exclusion). The actual placement
+  search (which address, in what order) is `pi` in the SA solver and the 2D no-overlap packing
+  in CP-SAT. Implemented, and the variable the whole scratchpad-planning pass exists to solve —
+  see [Scratchpad Planning](scratchpad_planning.md) for the full allocator architecture, and
+  note that the standalone, placement-only `SimulatedAnnealingLayoutSolver` (see
+  [Simulated Annealing Layout Planner](simulated_annealing_layout.md)) is a *different* class
+  from the joint `SaCoOptimizingSolver` — it only ever moves `pi`, never the division vector
+  `W` below.
+- **Work division** is how many cores an op's output or reduction uses, and which slice of the
+  iteration space each core owns — one split factor per iteration-space symbol. Splitting an
+  **output** dim gives each core a disjoint output slice; splitting a **reduction** dim gives
+  each core a partial result that must be combined. See
+  [Work Division Planning](work_division_planning.md) for the standalone 3-pass planner
+  (span-reduction, cost-model matmul split, default distribution) that picks this when the
+  co-optimizer isn't driving it. As a co-optimized variable, the joint solvers don't re-derive
+  divisions; they search over the *same* candidate space the standalone planner would offer,
+  pre-enumerated per op by `enumerate_work_division_candidates()` (`work_division.py`) and
+  attached to each buffer as a menu of `CoreDivision` candidates
+  (`CoreDivisionBuffer.core_divisions`, `plan_solver.py`). In the SA solver this menu index is
+  exactly the `W` half of the `(pi, W)` state; the **flip** move changes one buffer's chosen
+  index and resizes its per-core footprint, and **recolor** propagates a compatible change
+  across a connected region. In CP-SAT, the menu becomes a decision variable alongside
+  placement in the same constraint model.
 
-**As a co-optimized variable**: the joint solvers don't re-derive divisions; they search over
-the *same* candidate space the standalone planner would offer, pre-enumerated per op by
-`enumerate_work_division_candidates()` (`work_division.py`) and attached to each buffer as a
-menu of `CoreDivision` candidates (`CoreDivisionBuffer.core_divisions`,
-`plan_solver.py`). In the SA solver this menu index is exactly the `W` half of the `(pi, W)`
-state; the **flip** move changes one buffer's chosen index and resizes its per-core footprint,
-and **recolor** propagates a compatible change across a connected region. In CP-SAT, the menu
-becomes a decision variable alongside placement in the same constraint model.
+**Controlling it**: just the two base flags above — both `"cpsat"` and `"simulated_annealing"`
+reach this pair the same way, with no extra switch needed.
 
-**Status**: implemented and tested — e.g.
+**Status: implemented and tested together** — e.g.
 `test_a_flip_that_shrinks_a_footprint_into_capacity_raises_the_count` exercises exactly the
 scenario the joint search exists for: a buffer that doesn't fit undivided becomes eligible
-once a flip halves its footprint. The cost expression also prices division choice directly —
-`test_core_division_symbol_drives_the_score` shows the predicted score scaling with the number
-of cores a division uses, confirming it feeds the runtime term, not just a memory-fit
-heuristic.
+once a flip halves its footprint, moving both variables' state at once. The cost expression
+also prices division choice directly — `test_core_division_symbol_drives_the_score` shows the
+predicted score scaling with the number of cores a division uses, confirming it feeds the
+runtime term, not just a memory-fit heuristic.
 
-### c) Coarse tiling
+### b) LX placement, work division, and coarse tiling
 
 **What it is**: cutting an op's iteration space into sequential tile runs — a `TileSpec` of
 `TileAxis` entries (output and/or reduction axes, each with a count) — so a working set that
@@ -290,14 +308,17 @@ run is represented and survives scheduling and codegen — is implemented and do
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
+**Controlling it**: on top of the two base flags above (which still have to select CP-SAT —
+`layout_solver == "cpsat"` — for any of this to apply), `config.auto_coarse_tiling` (env
+`AUTO_COARSE_TILING`, off by default) is the dedicated switch for adding coarse tiling to the
+pair in (a). It's inert with `layout_solver` set to `"simulated_annealing"` or anything else.
+
 **Status: landed for CP-SAT, still in progress for simulated annealing.** The apply-side
 plumbing is landed for both solvers — `scratchpad/coarse_tiling.py` takes a `TileSpec` and
 lowers it to `DimHint`s, and `CoreDivision.tiling` / `min_footprint` in `plan_solver.py`
 already account for a tiling if one is present:
 
-- **CP-SAT**: landed via `#4768` (`main` as of this update). `config.auto_coarse_tiling`
-  (env `AUTO_COARSE_TILING=1`, off by default) lets the joint CP-SAT solve choose a coarse
-  tiling for each op alongside its core division; it has no effect with any other solver.
+- **CP-SAT**: landed via `#4768` (`main` as of this update).
 
   - **Candidates.** An op is offered the output-axis tilings `enumerate_tile_options` finds:
     never the stick dim, never a reduction axis, never an axis one of its reads repeats along
@@ -428,15 +449,17 @@ python3 tools/cost_model/eval_model.py --plot /tmp/after.png
 ```
 
 :::{figure} ../_static/images/lx/cost-model-pilot-scatter.png
-:alt: Log-log scatter of predicted vs. measured kernel_us for a 13-row pilot sweep, colored by category, with a 1:1 reference line
+:alt: Log-log scatter of predicted vs. measured kernel_us for a 20-row pilot sweep, colored by category, with a 1:1 reference line
 :width: 600px
 :align: center
 
-A real (not illustrative) `--plot` output from a 13-configuration pilot sweep
-(`run_cost_model_sweep.py --limit 20`, cut short mid-run). Most categories sit tight on the
-1:1 line; `matmul_k` (`matmul_k_tiling`, a coarse-K-tiled matmul) is the visible outlier,
-over-predicted by +137% in this run — exactly the kind of category-specific signal this plot
-is for, that the aggregate RMS% table alone would not point at directly.
+A real (not illustrative) `--plot` output from a complete 20-configuration pilot sweep
+(`run_cost_model_sweep.py --limit 20`, run to completion in ~8 minutes). Most categories sit
+tight on the 1:1 line; the two visible outliers are `matmul_k` (`matmul_k_tiling`, a
+coarse-K-tiled matmul), over-predicted by +137% in this run, and `softmax`
+(`softmax_row_tiling`'s heavily-tiled config, 8 tiles on 2 cores), under-predicted by -82% —
+exactly the kind of category- and config-specific signal this plot is for, that the aggregate
+RMS% table alone would not point at directly.
 :::
 
 Read the two PNGs side by side: points moving toward the 1:1 line is an improvement, points
@@ -478,13 +501,51 @@ loud warning instead of a quietly wrong measurement.
 - **Audit `sweep_plan.json`'s own coverage.** The plan is generated by deduplicating
   whatever configurations happen to already have measurements
   (`run_cost_model_sweep.py`'s `_configs()`, driven by `_env_from_record`) — there is no
-  code anywhere that checks the result for balance. The current skew (`mmwd` alone is 281
-  of 1632 configs; several categories in the [Accuracy](cost_model.md#accuracy) table rest
-  on a handful of rows) is therefore an artifact of what got measured historically, not a
-  deliberate weighting choice. Before leaning on the per-category RMS% numbers for a real
-  decision, re-derive what coverage and weighting the model actually *needs* — per
-  category, per shape range, per core count — and check the plan against that, rather than
-  assuming today's distribution reflects anyone's intent.
+  code anywhere that checks the result for balance, so today's distribution is an artifact
+  of what got measured historically, not a deliberate weighting choice. Measured directly
+  from `sweep_plan.json` (1632 configs total; `run_cost_model_sweep.py --dry-run` reports
+  1518 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
+  released build emits — and `bmm_3d2d_k_tiling`, quarantined after a real hardware incident
+  on 2026-08-07 rather than for being a bad config), grouped into
+  [Accuracy](cost_model.md#accuracy)'s own reporting categories:
+
+  <table>
+  <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1632</th></tr></thead>
+  <tbody>
+  <tr><td rowspan="9"><b>matmul/bmm</b><br/>573 (35.1%)</td><td>matmul_split (<code>mmwd</code>)</td><td align="right">281</td><td align="right">17.2%</td></tr>
+  <tr><td>bmm_split</td><td align="right">113</td><td align="right">6.9%</td></tr>
+  <tr><td>matmul_row</td><td align="right">93</td><td align="right">5.7%</td></tr>
+  <tr><td>bmm</td><td align="right">23</td><td align="right">1.4%</td></tr>
+  <tr><td>matmul</td><td align="right">18</td><td align="right">1.1%</td></tr>
+  <tr><td>matmul_k</td><td align="right">15</td><td align="right">0.9%</td></tr>
+  <tr><td>matmul_nested</td><td align="right">13</td><td align="right">0.8%</td></tr>
+  <tr><td>bmm_3d2d (skipped)</td><td align="right">9</td><td align="right">0.6%</td></tr>
+  <tr><td>bmm_nested</td><td align="right">8</td><td align="right">0.5%</td></tr>
+  <tr><td rowspan="2"><b>softmax</b><br/>138 (8.5%)</td><td>softmax</td><td align="right">113</td><td align="right">6.9%</td></tr>
+  <tr><td>softmax_unrolled</td><td align="right">25</td><td align="right">1.5%</td></tr>
+  <tr><td rowspan="2"><b>reduction</b><br/>206 (12.6%)</td><td>reduction (plain)</td><td align="right">155</td><td align="right">9.5%</td></tr>
+  <tr><td>coarse_reduction</td><td align="right">51</td><td align="right">3.1%</td></tr>
+  <tr><td colspan="2">broadcast</td><td align="right">226</td><td align="right">13.8%</td></tr>
+  <tr><td colspan="2">transport</td><td align="right">172</td><td align="right">10.5%</td></tr>
+  <tr><td colspan="2">pointwise</td><td align="right">168</td><td align="right">10.3%</td></tr>
+  <tr><td colspan="2">other (incl. <code>bmm_layout</code>, skipped)</td><td align="right">149</td><td align="right">9.1%</td></tr>
+  </tbody>
+  </table>
+
+  Summed by family, matmul/bmm+softmax together are 711/1632 (43.6%) — well under
+  broadcast+transport+pointwise+reduction's combined 921/1632 (56.4%), so "matmul-biased"
+  overstates it at the top level. The real skew is *within* the matmul family: `mmwd` alone
+  (17.2%) outweighs every other single op by a wide margin, while five matmul/bmm
+  sub-categories — `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, `bmm_nested` — each
+  rest on under 20 configs (8 to 18). Their rows in the Accuracy table are the ones to treat
+  as statistically thin regardless of how important those ops are architecturally; a
+  category needs enough configs to average out per-run noise (the pilot sweep above shows
+  single-digit `kernel_us_cv` swings even within one config's 7 reps) before its RMS% number
+  means much. Before leaning on the per-category RMS% numbers for a real decision, re-derive
+  what coverage and weighting the model actually *needs* — per category, per shape range,
+  per core count — and check the plan against that, rather than assuming today's
+  distribution reflects anyone's intent. See [Ongoing work](#ongoing-work) for a concrete
+  plan to act on this rather than just flagging it.
 - **New co-optimized axes need their own sweep configs, deliberately added.** CP-SAT's
   solver-chosen coarse tiling (`#4768`, `config.auto_coarse_tiling`, described above) landed
   without one: checked directly against the landed commit, it touches neither `profile_ops.py`,
@@ -546,6 +607,33 @@ Open items from drafting this page that are worth resolving before calling it do
   pre-coarse-tiling code the SA stack is extending. Worth a terminology pass across the
   documents *and* that code once coarse tiling lands, so "division"/"split" and "tiling" stay
   consistently distinct.
+- **A concrete plan for rebalancing `sweep_plan.json`**, picking up the coverage audit above:
+  1. **Set a minimum-sample floor per category** before trusting its RMS% number for a real
+     decision — e.g. 20 configs as a starting bar (matching the under-20 threshold already
+     flagged above). `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, and `bmm_nested` fall
+     below it today.
+  2. **Add targeted configs for each under-floor category**, varying the dimension most
+     likely to matter for that op (core count for `matmul`/`bmm` families; tile count for
+     the `_k_tiling`/`_nested` variants) rather than just repeating the same shape — a
+     config that doesn't vary anything new doesn't reduce the real uncertainty, only the
+     per-run measurement noise.
+  3. **Measure the new configs**: `python3 docs/source/user_guide/examples/profile_ops.py`
+     for a one-off, or add them to a local copy of `sweep_plan.json` and run
+     `run_cost_model_sweep.py --configs <path>` for a batch; `BENCH_EMIT_RECORDS=1` and
+     `SPYRE_DUMP_COST=1` must both be set (the sweep driver already sets them) so the new
+     rows carry `feats`, not just `io`.
+  4. **Fold the result back into the shipped plan**: once new measurements exist in a local
+     `sweep_records.json`, `run_cost_model_sweep.py --from-records --export-configs
+     tools/cost_model/sweep_plan.json` regenerates the committed plan from every
+     configuration that database now contains, including the new ones — this is also how
+     any future solver-driven-coarse-tiling knob (the gap flagged above) would get its own
+     sweep coverage once one exists.
+  5. **Re-check with `eval_model.py`**: confirm the previously-thin categories' RMS% is now
+     computed over a real sample, and `--plot` the new scatter against the old one the way
+     [Keeping the model honest](#keeping-the-model-honest-recalibrating-against-real-hardware)
+     already describes for a `cost_model.py` edit — the same before/after comparison applies
+     to a sweep-plan change, since both move the measured population the model is scored
+     against.
 
 ## Related documents
 
