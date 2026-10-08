@@ -468,7 +468,7 @@ def plot_scatter(evaluated, out_path):
 
     by_cat = {}
     for r, pred, meas, _err, _src in evaluated:
-        by_cat.setdefault(category(r["op"]), []).append((meas, pred))
+        by_cat.setdefault(category(r["op"]), []).append((pred, meas))
 
     fig, ax = plt.subplots(figsize=(7, 7))
     for c in sorted(by_cat):
@@ -492,10 +492,10 @@ def plot_scatter(evaluated, out_path):
 
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("measured kernel_us")
-    ax.set_ylabel("predicted kernel_us")
+    ax.set_xlabel("predicted kernel_us")
+    ax.set_ylabel("measured kernel_us")
     ax.set_title(
-        f"predicted vs. measured ({len(evaluated)} rows)\nMSE={mse:,.0f} us^2  RMSE={rmse:,.1f} us"
+        f"measured vs. predicted ({len(evaluated)} rows)\nMSE={mse:,.0f} us^2  RMSE={rmse:,.1f} us"
     )
     ax.legend(fontsize=7, loc="upper left")
     ax.set_aspect("equal", adjustable="box")
