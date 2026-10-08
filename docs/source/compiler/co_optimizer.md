@@ -6,7 +6,7 @@
 This is a first draft assembled from `sa_co_optimization.md`, `scratchpad_planning.md`,
 `work_division_planning.md`, and the current state of
 `torch_spyre/_inductor/scratchpad/`. It is meant as a jumping-off point for review, not a
-finished page — see the open questions in [Status of coarse tiling](#status-of-coarse-tiling)
+finished page — see the open questions in [Ongoing work](#ongoing-work)
 before relying on any claim there.
 :::
 
@@ -14,7 +14,8 @@ This page is the map of **why** torch-spyre co-optimizes several compiler decisi
 instead of solving each one separately, **how** that joint search works in general, and
 **which** decisions it currently covers. For the full detail on any one piece, follow the links
 into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](work_division_planning.md),
-and [Joint core-division + LX placement](sa_co_optimization.md).
+[Joint core-division + LX placement](sa_co_optimization.md), and
+[Analytical Cost Model](cost_model.md).
 
 **Quick navigation:**
 
@@ -25,7 +26,7 @@ and [Joint core-division + LX placement](sa_co_optimization.md).
   - [Work division](#b-work-division)
   - [Coarse tiling](#c-coarse-tiling)
 - [Cost model](#cost-model)
-- [Status of coarse tiling](#status-of-coarse-tiling)
+- [Ongoing work](#ongoing-work)
 - [Related documents](#related-documents)
 
 ## Why a co-optimizer
@@ -321,9 +322,11 @@ of this draft.
 ## Cost model
 
 Both production solvers share one cost model (`torch_spyre/_inductor/cost_model.py`) — the
-same `predict_by_bundle` / `cost_expr` referenced throughout the sections above. This section
-covers the model as its own piece: how it is wired into each solver, how to see what it
-predicted for a real compile, and how its constants should be kept honest against real
+same `predict_by_bundle` / `cost_expr` referenced throughout the sections above. See
+[Analytical Cost Model](cost_model.md) for the model in full: how a kernel is priced, every
+`SPYRE_DUMP_COST` output shape, the measure-and-score workflow, and the current accuracy
+table. This section covers only what's specific to the *co-optimizer's* use of it: how each
+solver consumes the same expression differently, and how to recalibrate it against real
 hardware.
 
 ### How it's integrated: symbolic (CP-SAT) vs. compiled-and-evaluated (SA)
@@ -368,37 +371,105 @@ Same model, same expression, two different consumption strategies: one treats it
 constraint to satisfy exactly, the other as a function to sample cheaply, many times, during a
 heuristic search.
 
-### Inspecting a prediction: `SPYRE_DUMP_COST`
+### Inspecting a co-optimized solve
 
-`SPYRE_DUMP_COST=1` (see `dump_cost_model.py`) prints a human-readable breakdown of the cost
-model's prediction for every bundle in a real compile — the same `explain()` function used
-throughout this page's examples. For a single `128×512 @ 512×256` matmul on 32 cores:
-
-```
-  mm           read=393216B write=65536B lx=0B
-      output op0       torch [128, 256] -> device [4, 128, 64] in HBM | 32768 elems x 2B = 65536 B (hbm counted: 65536 B) graph boundary (charged despite LX)
-      input  arg0_1     torch [128, 512] -> device [8, 128, 64] in HBM | 65536 elems x 2B = 131072 B (hbm counted: 131072 B) x4 consumers broadcast (loaded once) graph boundary (clone-in charged here if LX)
-      input  arg1_1     torch [512, 256] -> device [4, 512, 64] in HBM | 131072 elems x 2B = 262144 B (hbm counted: 262144 B) x8 consumers broadcast (loaded once) graph boundary (clone-in charged here if LX)
-  -- prediction (turnaround, bundled matmul model): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
-     R=393216B (read)   W=65536B (write)
-     compute = MACs/cores/(mac_peak*pt_eff) = 16777216/32/(1140*0.616) = 0.75 us  (M/m=16, pt_eff=0.616)
-     base = R/150 + W/150 = 3.06 us
-     turn = a*min(R,W) = 0.00574*65536 = 0.38 us
-     => T_model = 3.43 us
-```
-
-`SPYRE_DUMP_COST_EXPR_FILE=<path>` is the companion machine-readable dump: one JSON line per
-solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's per-bundle
-terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually chose, every
-term evaluated under those bindings, and the alternative divisions each buffer could have taken
-instead — a self-describing record of one solve, meant to be read without needing to know which
-flags produced it.
+[What it prints when turned on](cost_model.md#what-it-prints-when-turned-on) covers
+`SPYRE_DUMP_COST`'s per-bundle breakdown in full, with worked examples; it applies unchanged
+here since the co-optimizer calls the same `explain()`. The one thing specific to a *co-optimized*
+solve is `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line
+per solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
+per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
+chose, every term evaluated under those bindings, and the alternative divisions each buffer
+could have taken instead — a self-describing record of one solve, meant to be read without
+needing to know which flags produced it.
 
 ### Keeping the model honest: recalibrating against real hardware
 
-*(placeholder — to fill in)*
+[Measuring, scoring and refreshing the model](cost_model.md#measuring-scoring-and-refreshing-the-model)
+is the real workflow this subsection builds on — read it first. In short: `profile_ops.py`
+measures one op under `torch.profiler` and prints a parseable summary; `run_cost_model_sweep.py`
+drives it over `tools/cost_model/sweep_plan.json`'s 1632 configurations and folds the result
+into `tools/cost_model/sweep_records.json` (not committed — it's measured device time, so it
+belongs to the machine and build that produced it); `tools/cost_model/eval_model.py` then
+scores any model version against that database with no hardware involved, reporting RMS% of
+relative error per op category (the table in
+[Accuracy](cost_model.md#accuracy): 5.0% for broadcast up to 29.8% for matmul-split).
 
-## Status of coarse tiling
+`sweep_plan.json` is a list of **environments, not measurements** — each entry is the
+`profile_ops.py` env-var invocation for one configuration (`BENCH_OP`, shape knobs like
+`BENCH_ROWS`/`BENCH_COLS`/`BENCH_N`/`BENCH_B`, `SENCORES`, coarse-tiling via `BENCH_TILES`/
+`LX_PLANNING`, and, where the kernel needs one, an explicit work-division or layout override
+via `WD_M`/`WD_N`/`WD_K`/`WD_B`/`WD_LAYOUT_A`/`WD_LAYOUT_B` or a flash-attention shape via
+`FA_H`/`FA_LQ`/`FA_LK`/`FA_D`). It spans around 40 distinct kernels across every category the
+accuracy table scores: pointwise (`add`, `neg`, `gelu`, broadcast variants), reductions
+(`sumrow`, `amax`, `mean`), transport (`copy`, `transpose`, `cat0`/`cat1`), softmax (plain,
+row-tiled, unrolled), and the matmul/bmm family under several work-division and coarse-tiling
+variants (`mmwd`, `matmul_row_tiling`, `bmm_wd`, `bmm_k_tiling`, …), plus a handful of flash-
+attention configurations. Being an environment list rather than a frozen measurement set means
+it is small, portable, and reproducible on new hardware or after a compiler change — re-running
+it is what regenerates `sweep_records.json` from scratch.
+
+That RMS%-of-relative-error metric is deliberately not a plain MSE in time units — a 5 µs error
+on a 10 µs kernel and a 500 µs error on a 1 ms kernel both read as the same 50%, which is what
+you want when the model is used to *rank* candidate plans against each other rather than to
+predict a wall-clock number (see Accuracy's note on rank correlation surviving the model's
+systematic under-prediction). `eval_model.py --plot <path.png>` adds the complementary view: a
+log-log scatter of predicted vs. measured `kernel_us`, one point per scored row, colored by
+category, with the 1:1 line and the overall MSE/RMSE **in time units** annotated —
+
+```bash
+python3 tools/cost_model/eval_model.py --plot /tmp/before.png   # before a cost_model.py edit
+# ... edit torch_spyre/_inductor/cost_model.py, or re-run with --params k=v overrides ...
+python3 tools/cost_model/eval_model.py --plot /tmp/after.png
+```
+
+:::{figure} ../_static/images/lx/cost-model-pilot-scatter.png
+:alt: Log-log scatter of predicted vs. measured kernel_us for a 13-row pilot sweep, colored by category, with a 1:1 reference line
+:width: 600px
+:align: center
+
+A real (not illustrative) `--plot` output from a 13-configuration pilot sweep
+(`run_cost_model_sweep.py --limit 20`, cut short mid-run). Most categories sit tight on the
+1:1 line; `matmul_k` (`matmul_k_tiling`, a coarse-K-tiled matmul) is the visible outlier,
+over-predicted by +137% in this run — exactly the kind of category-specific signal this plot
+is for, that the aggregate RMS% table alone would not point at directly.
+:::
+
+Read the two PNGs side by side: points moving toward the 1:1 line is an improvement, points
+moving away in one category only is a regression confined to that category (check that
+category's row in the RMS% table to confirm), and a cloud that barely shifts between the two
+images alongside a near-identical RMSE is a no-op change. The scatter is log-log because the
+sweep's `kernel_us` spans about three orders of magnitude (tens of µs for `transpose`/pointwise
+up to several ms for forced-split matmuls); a linear scale would collapse every small kernel
+into the origin and show nothing about them. `--plot` needs matplotlib, which is **not** a
+torch-spyre dependency (base or optional) — install it separately; the flag fails with a clear
+message instead of a traceback when it's missing.
+
+**Does the sweep need to disable the co-optimizer, so a `WD_*`-forced configuration isn't
+silently overwritten by the joint search?** No. A forced split uses `spyre_hint(work_div=...)`
+(see [How it's integrated](#how-its-integrated-symbolic-cp-sat-vs-compiled-and-evaluated-sa)
+above for what a hint actually does to the solver's input), and `allocator.py`'s division-menu
+builder special-cases a resolved hint before either solver ever runs: it collapses that op's
+candidate list to the single fixed division the hint requested
+(`_legal_fixed_division`, `reason = "user work_div hint"`), so there is nothing left for
+CP-SAT or SA to search over for that op. Confirmed empirically, not just read in code: a pilot
+sweep's `bmm_wd` row requesting `WD_B=1 WD_K=1 WD_M=8 WD_N=4` produced a compiled kernel whose
+dumped `MODEL FEATS` carry exactly `cores=32, matmul_m_split=8, matmul_n_split=4` — the forced
+split, unperturbed. An op with no `WD_*` override is intentionally left for the co-optimizer to
+decide, since those configurations exist to measure the *default* co-optimized behavior.
+
+**Does anything check that the requested config is actually what got measured?** It does now.
+`sweep_records.json` already had `split_forced`/`split_actual` fields meant for exactly this,
+but they were silently dead: the regex that filled them matched an older label format that
+`profile_ops.py` no longer prints, so both fields parsed to `None` on every current-format row
+without erroring. Fixed in `parse_sweep_logs.py` — new patterns match the current
+`WD_M=../WD_N=../WD_K=..`-style label, and `split_actual` falls back to reading the matmul's
+`matmul_m_split`/`matmul_n_split`/`reduction_cores` straight out of `feats` (populated on every
+run) when the older debug-only `op_it_space_splits` text isn't present. The parser now also
+warns on any row where the two disagree, so a hint that silently failed to take shows up as a
+loud warning instead of a quietly wrong measurement.
+
+## Ongoing work
 
 Open items from drafting this page that are worth resolving before calling it done:
 
@@ -418,6 +489,9 @@ Open items from drafting this page that are worth resolving before calling it do
 
 ## Related documents
 
+- [Analytical Cost Model](cost_model.md) — the model in full: how a kernel is priced, every
+  `SPYRE_DUMP_COST` output shape, the measure-and-score workflow, and the current accuracy
+  table
 - [Scratchpad Planning](scratchpad_planning.md) — the allocator architecture, the solvers, LX
   eligibility rules, and the memory-hierarchy background
 - [Work Division Planning](work_division_planning.md) — the standalone work-division planner
