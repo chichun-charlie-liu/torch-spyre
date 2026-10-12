@@ -338,8 +338,9 @@ already account for a tiling if one is present:
     buffers in LX, so its producer and consumer never share a nest.
   - **Loop groups.** Consecutive ops that run the same loop nest (the same trip count at each
     level) share a loop group. The solve requires every producer/consumer edge inside a group
-    to be a compatible pair, and `CoarseTilingPass` checks each such edge again before applying
-    the tiling.
+    to be a compatible pair. `CoarseTilingPass` checks each such edge again and starts a new
+    group at a consumer that does not read its producer tile by tile, which then reads the
+    producer's full buffer; a plan from this solve never has one.
   - **Objective.** The cost expression itself is not used, since it has no term for tile size
     or loop-group boundaries — the solve instead ranks plans lexicographically: LX residency,
     then *cuts* (tiled ops whose value must be copied out of their nest, for a consumer outside

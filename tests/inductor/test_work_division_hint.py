@@ -381,6 +381,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -410,6 +411,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -791,11 +793,12 @@ def test_fixed_plan_handoff_keeps_feature_gates(mode):
 def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     allocator = allocator_module.CoOptimizingAllocator(GreedyLayoutSolver, 256)
     graph = _allocation_graph()
+    division_map = allocator_module._DivisionMap({}, set())
     with (
         mock_patch.object(
             allocator, "_determine_in_place_division_invariant", return_value={}
         ),
-        mock_patch.object(allocator, "_division_map", return_value={}),
+        mock_patch.object(allocator, "_division_map", return_value=division_map),
         mock_patch.object(
             allocator, "_build_cd_bound_buffers", return_value=[]
         ) as build,
@@ -803,7 +806,7 @@ def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     ):
         allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
     collect.assert_not_called()
-    build.assert_called_once_with(graph, {}, {})
+    build.assert_called_once_with(graph, {}, division_map)
 
 
 @pytest.mark.parametrize(
