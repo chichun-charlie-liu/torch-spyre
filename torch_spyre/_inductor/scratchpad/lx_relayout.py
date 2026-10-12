@@ -800,10 +800,11 @@ def solver_relayout_edge_context(
     # restickify under read-copy-elision's own deferred direct-read handling
     # (the same marker _distribute_work's division gate checks): that
     # mechanism already owns this edge's placement, so relayout must not
-    # also offer a candidate for it. The fitted relayout cost still prices
-    # one tile's worth, not loop_count tiles' worth, which under-prices
-    # (never over-prices) a same-group candidate; harmless since the solver
-    # only takes it when it beats the real alternative anyway.
+    # also offer a candidate for it. The fitted relayout law still prices
+    # one tile's worth; _cd_parent_relayouts (allocator.py) scales that by
+    # the parent's own loop trip count before handing a same-group candidate
+    # to the solver, so a repeated shuffle is priced at its real total cost,
+    # not once.
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (

@@ -5225,6 +5225,86 @@ class TestRecoverSpyreHints(unittest.TestCase):
             "the graph",
         )
 
+    def test_unrelated_while_loop_body_name_does_not_block_recovery(self):
+        """A GraphModule attribute named like a while_loop body, but with no
+        actual while_loop HOP call pointing at it, must not be counted as a
+        recovery target.
+
+        Pins cyang49's PR #5057 review blocker: the old discovery walked every
+        get_attr node whose *target name* contained "while_loop_body_graph" --
+        upstream PyTorch's generic naming for any while_loop body, scan-decomposed
+        or not. A get_attr with that name but no corresponding while_loop call (or
+        a plain, independently-authored torch.while_loop coexisting with a scan's)
+        would inflate body_nodes past subgraph_snapshots and abandon recovery for
+        every real scan site, not just the unrelated one. Discovery must instead
+        match on the while_loop HOP call's own body_fn arg, the same way
+        _scan_combine_subgraphs matches scan calls instead of a name substring.
+        """
+        from torch_spyre._inductor.propagate_hints import _recover_hop_subgraph_hints
+
+        root = torch.nn.Module()
+
+        # The scan's combine-fn body, with one hinted node to recover.
+        body_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        bg = body_gm.graph
+        carry = bg.placeholder("carry")
+        x = bg.placeholder("x")
+        add = bg.call_function(torch.ops.aten.add.Tensor, (carry, x))
+        bg.output((add, None))
+        body_gm.recompile()
+        root.while_loop_body_graph_0 = body_gm
+
+        # An unrelated GraphModule attribute that merely shares the name
+        # fragment "while_loop_body_graph" -- no while_loop HOP call anywhere
+        # in the root graph points at it.
+        decoy_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        dg = decoy_gm.graph
+        p = dg.placeholder("x")
+        neg = dg.call_function(torch.ops.aten.neg.default, (p,))
+        dg.output(neg)
+        decoy_gm.recompile()
+        root.unrelated_while_loop_body_graph_decoy = decoy_gm
+
+        # A trivial cond_fn for the real while_loop call.
+        cond_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_gm.graph
+        cp = cg.placeholder("carry")
+        cg.placeholder("x")
+        lt = cg.call_function(torch.ops.aten.lt.Scalar, (cp, 4))
+        cg.output(lt)
+        cond_gm.recompile()
+        root.while_loop_cond_graph_0 = cond_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        cond_attr = graph.get_attr("while_loop_cond_graph_0")
+        body_attr = graph.get_attr("while_loop_body_graph_0")
+        graph.call_function(
+            torch.ops.higher_order.while_loop,
+            (cond_attr, body_attr, (init, xs)),
+        )
+        # The decoy is still reachable from the root graph (as any
+        # not-yet-DCE'd subgraph would be) but nothing calls it.
+        graph.get_attr("unrelated_while_loop_body_graph_decoy")
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        snapshot = [(add.target, {"_hint_0": {"work_div": {"K": 2}}})]
+        _recover_hop_subgraph_hints(gm.graph, [snapshot])
+
+        recovered = [n for n in body_gm.graph.nodes if n.meta.get("custom")]
+        self.assertEqual(
+            len(recovered),
+            1,
+            "expected the scan's real while_loop body to recover its hint "
+            "despite the decoy attribute sharing its name fragment",
+        )
+        self.assertEqual(
+            recovered[0].meta["custom"], {"_hint_0": {"work_div": {"K": 2}}}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

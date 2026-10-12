@@ -352,10 +352,27 @@ def _recover_hop_subgraph_hints(
     by content or rely on the old node surviving; instead the pairing is
     positional: decompose_scan_to_while_loop replaces each matched `scan` node
     in place without reordering matches relative to each other, so the Nth
-    get_attr node (in graph.nodes order) whose target is a while_loop body
-    subgraph corresponds to the Nth scan-combine-fn subgraph collect_spyre_hints
-    snapshotted (verified empirically across 1-3 scan sites, including with
-    the two name orders scrambled relative to each other).
+    while_loop HOP call node (in graph.nodes order) corresponds to the Nth
+    scan-combine-fn subgraph collect_spyre_hints snapshotted (verified
+    empirically across 1-3 scan sites, including with the two name orders
+    scrambled relative to each other).
+
+    Matched on the while_loop HOP call itself (its body_fn arg), the same way
+    _scan_combine_subgraphs matches scan calls -- not on "any get_attr named
+    while_loop_body_graph_*": that name is upstream PyTorch's generic naming
+    for every while_loop body, scan-decomposed or not, so a get_attr with no
+    corresponding while_loop call at all (e.g. an unrelated GraphModule
+    attribute that happens to share the name fragment) would inflate
+    body_nodes past subgraph_snapshots and abandon recovery for every real
+    scan site too. This does not fully disambiguate a scan-derived while_loop
+    from a plain, user-authored torch.while_loop call that happens to coexist
+    in the same graph -- decompose_scan_to_while_loop builds the replacement
+    via its own fresh make_fx trace with no identity link back to the
+    original scan node, the same "can't rely on identity surviving" limit
+    this function's own docstring already states for the body subgraph.
+    Narrowing the match to a real while_loop HOP call closes the demonstrated
+    gap (a non-while_loop attribute colliding on name) without claiming to
+    solve that harder, open problem.
 
     collect_spyre_hints snapshots every scan, hinted or not, so this
     positional pairing holds even when only some scans in the graph carry a
@@ -368,16 +385,30 @@ def _recover_hop_subgraph_hints(
 
     body_nodes: list[torch.fx.Node] = []
     for node in graph.nodes:
-        if node.op != "get_attr":
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.higher_order.while_loop
+        ):
             continue
-        target = getattr(graph.owning_module, node.target, None)
-        if not isinstance(target, torch.fx.GraphModule):
+        # decompose_scan_to_while_loop always builds its replacement as
+        # while_loop(cond_fn, body_fn, carried_inputs) with body_fn a literal
+        # get_attr node (torch/_inductor/fx_passes/post_grad.py), so a
+        # while_loop call that doesn't have that shape -- body_fn passed as a
+        # kwarg, an inlined callable, a hand-built or otherwise-transformed
+        # graph -- is, by construction, not scan-derived. Skip it rather than
+        # assert: unlike the body subgraph identity problem this function's
+        # own docstring describes (which we can't resolve, only pair
+        # positionally), this is a shape check we CAN make, and getting it
+        # wrong by crashing the whole compile on a merely-unusual while_loop
+        # call would be worse than this function's declared failure mode
+        # (skip subgraph hint recovery, log, keep compiling) for every other
+        # case this pass handles.
+        if len(node.args) < 2:
             continue
-        # decompose_scan_to_while_loop always names a scan's replacement body
-        # "while_loop_body_graph_*" -- excludes the sibling cond graph and the
-        # old, now-orphaned scan_combine_graph_* node.
-        if "while_loop_body_graph" in node.target:
-            body_nodes.append(node)
+        body_fn_node = node.args[1]
+        if not isinstance(body_fn_node, torch.fx.Node) or body_fn_node.op != "get_attr":
+            continue
+        body_nodes.append(body_fn_node)
 
     if len(body_nodes) != len(subgraph_snapshots):
         logger.debug(
@@ -392,7 +423,14 @@ def _recover_hop_subgraph_hints(
     for body_node, snapshot in zip(body_nodes, subgraph_snapshots):
         if not any(custom for _, custom in snapshot):
             continue
-        sub_gm = getattr(graph.owning_module, body_node.target)
+        sub_gm = getattr(graph.owning_module, body_node.target, None)
+        if not isinstance(sub_gm, torch.fx.GraphModule):
+            logger.debug(
+                "recover_spyre_hints: while_loop body attribute %s did not "
+                "resolve to a GraphModule; skipping its hint recovery.",
+                body_node.target,
+            )
+            continue
         nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
         matched, hinted = _apply_snapshot(nodes, snapshot)
         if matched < hinted:
