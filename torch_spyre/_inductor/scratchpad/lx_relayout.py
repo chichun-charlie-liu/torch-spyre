@@ -796,14 +796,22 @@ def solver_relayout_edge_context(
     # staging op a relayout can't account for. That doesn't apply when
     # producer and consumer share the exact same loop_group_id -- same
     # iteration, same tile, direct read, no staging op between them -- so
-    # that one case is let through. The fitted relayout cost still prices one
-    # tile's worth, not loop_count tiles' worth, which under-prices (never
-    # over-prices) a same-group candidate; harmless since the solver only
-    # takes it when it beats the real alternative anyway.
+    # that one case is let through, unless the consumer is already a
+    # restickify under read-copy-elision's own deferred direct-read handling
+    # (the same marker _distribute_work's division gate checks): that
+    # mechanism already owns this edge's placement, so relayout must not
+    # also offer a candidate for it. The fitted relayout cost still prices
+    # one tile's worth, not loop_count tiles' worth, which under-prices
+    # (never over-prices) a same-group candidate; harmless since the solver
+    # only takes it when it beats the real alternative anyway.
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
+    consumer_is_read_copy_elision_candidate = is_restickify_op(
+        consumer, graph
+    ) and hasattr(consumer, "_read_copy_elision_record")
     same_tile_group = (
-        isinstance(producer_loop_info, CoarseTileInfo)
+        not consumer_is_read_copy_elision_candidate
+        and isinstance(producer_loop_info, CoarseTileInfo)
         and isinstance(consumer_loop_info, CoarseTileInfo)
         and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
     )
