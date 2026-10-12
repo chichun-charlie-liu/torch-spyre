@@ -806,14 +806,14 @@ def solver_relayout_edge_context(
     # only takes it when it beats the real alternative anyway.
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
-    consumer_is_read_copy_elision_candidate = is_restickify_op(
-        consumer, graph
-    ) and hasattr(consumer, "_read_copy_elision_record")
     same_tile_group = (
-        not consumer_is_read_copy_elision_candidate
-        and isinstance(producer_loop_info, CoarseTileInfo)
+        isinstance(producer_loop_info, CoarseTileInfo)
         and isinstance(consumer_loop_info, CoarseTileInfo)
         and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
+        and not (
+            hasattr(consumer, "_read_copy_elision_record")
+            and is_restickify_op(consumer, graph)
+        )
     )
     if (
         producer_loop_info is not None or consumer_loop_info is not None
