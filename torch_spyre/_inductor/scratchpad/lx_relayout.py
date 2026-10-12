@@ -48,6 +48,7 @@ from ..core_mapping import (
 from ..cost_model import OpFeatures, relayout_ns
 from ..dump_cost_model import governing_run_split
 from ..ir import FixedTiledLayout
+from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
@@ -790,18 +791,25 @@ def solver_relayout_edge_context(
     loop-symbol -> extent mappings ``work_division_from_view`` projects into -
     or ``None`` when the edge can never host a relayout.
     """
-    # A coarse-tiled endpoint can never host a relayout. The fitted law has
-    # no loop_trip factor (the committed-path planner already guarantees "a
-    # relayout cannot be inside a coarse-tiling loop"), a tiled producer's
-    # buffer is per-tile scratch rather than the full tensor, and a tiled
-    # consumer reads cross-group data through a per-iteration staging op.
-    # The MutationLayout check below only screens the loop's DRAIN op; the
-    # staging and tiled compute ops are plain Pointwise buffers, so the
-    # loop_info presence is the reliable marker.
+    # A coarse-tiled endpoint can usually never host a relayout: a tiled
+    # consumer in general reads cross-group data through a per-iteration
+    # staging op a relayout can't account for. That doesn't apply when
+    # producer and consumer share the exact same loop_group_id -- same
+    # iteration, same tile, direct read, no staging op between them -- so
+    # that one case is let through. The fitted relayout cost still prices one
+    # tile's worth, not loop_count tiles' worth, which under-prices (never
+    # over-prices) a same-group candidate; harmless since the solver only
+    # takes it when it beats the real alternative anyway.
+    producer_loop_info = getattr(producer, "loop_info", None)
+    consumer_loop_info = getattr(consumer, "loop_info", None)
+    same_tile_group = (
+        isinstance(producer_loop_info, CoarseTileInfo)
+        and isinstance(consumer_loop_info, CoarseTileInfo)
+        and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
+    )
     if (
-        getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
-    ):
+        producer_loop_info is not None or consumer_loop_info is not None
+    ) and not same_tile_group:
         return None
     if (
         not isinstance(producer, ComputedBuffer)

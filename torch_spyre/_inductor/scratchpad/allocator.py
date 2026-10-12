@@ -3877,6 +3877,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op_by_name,
                 prep_cache,
                 residency_by_buf,
+                cd_parent_matches,
             )
 
             # A for_each_tile update writes through a MutationLayout whose
@@ -4363,6 +4364,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         candidates: list[RelayoutCandidate],
         consumer_divs: list[CoreDivision],
         consumer_costs: dict[int, float] | None = None,
+        pinned_consumer_divisions: frozenset[int] = frozenset(),
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
         cheapest destination views of one (source, consumer) edge.
@@ -4378,6 +4380,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         a consumer division without a copy is treated exactly like an unpriced
         pair (match for free or spill), and every fired relayout is still
         certified at materialization.
+
+        ``pinned_consumer_divisions`` (divisions another parent already
+        matches for free, per ``_cd_parent_matches``) are kept regardless of
+        cost rank: cost alone can't see that reaching one of them lets every
+        parent land on the same division, so the cap must not drop it.
         """
         cap = config.lx_solver_relayout_groups_per_edge
         if cap <= 0 or not candidates:
@@ -4387,6 +4394,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             by_group.setdefault(candidate.group, []).append(candidate)
         if len(by_group) <= cap:
             return candidates
+
+        pinned_groups = {
+            group
+            for group, members in by_group.items()
+            if any(c.consumer_division in pinned_consumer_divisions for c in members)
+        }
 
         def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
             group, members = item
@@ -4402,13 +4415,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
-        kept = {group for group, _ in sorted(by_group.items(), key=rank)[:cap]}
+        remaining = cap - len(pinned_groups)
+        ranked = [item for item in by_group.items() if item[0] not in pinned_groups]
+        cost_kept = {
+            group for group, _ in sorted(ranked, key=rank)[: max(remaining, 0)]
+        }
+        kept = pinned_groups | cost_kept
         logger.debug(
-            "[lx solver relayout] %s -> %s: keeping %d of %d destination views",
+            "[lx solver relayout] %s -> %s: keeping %d of %d destination views"
+            " (%d pinned by a sibling parent match)",
             parent,
             consumer,
             len(kept),
             len(by_group),
+            len(pinned_groups),
         )
         return [c for c in candidates if c.group in kept]
 
@@ -4457,6 +4477,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
+        cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]] = None,
     ) -> dict[str, list[RelayoutCandidate]]:
         """Priced relayout candidates for each divided producer this op reads.
 
@@ -4470,6 +4491,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on
         ``lx_solver_relayout()`` (the solver kind decides relayouts).
+
+        ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
+        gives each parent's cap-and-rank step the other parents' already-free
+        divisions, so it won't drop the one group that would let this parent
+        join them.
         """
         if not lx_solver_relayout() or config.ktir_emitter:
             return {}
@@ -4671,12 +4697,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         consumer_op.get_name(),
                         exc,
                     )
+            sibling_pinned = frozenset(
+                j
+                for other_parent, pairs in (cd_parent_matches or {}).items()
+                if other_parent != parent
+                for _, j in pairs
+            )
             candidates = self._cap_relayout_groups(
                 parent,
                 consumer_op.get_name(),
                 candidates,
                 consumer_divs,
                 consumer_costs,
+                sibling_pinned,
             )
             if candidates:
                 relayouts[parent] = candidates
