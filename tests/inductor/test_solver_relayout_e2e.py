@@ -655,6 +655,11 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     ):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
+    # Graph-global, same as the test this replaces: also covers each body's
+    # own within-scope edges, which happen to offer nothing for this graph's
+    # shapes. A future same-group change that makes one of those offer could
+    # fail this assert looking like a cross-group regression when it isn't;
+    # the printed table disambiguates by parent/consumer name.
     assert tables == [], (
         f"cross-group coarse-tiled edges were offered relayout: {tables}"
     )
