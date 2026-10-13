@@ -70,6 +70,17 @@ class DimHint:
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
 
+# meta["custom"] key under which collect_spyre_hints stamps each scan node
+# with its position in _scan_combine_subgraphs's encounter order, so the
+# while_loop that decompose_scan_to_while_loop replaces the scan with can be
+# paired back to that snapshot: the stamp rides through the replacement
+# because meta["custom"] is a torch.fx.proxy._COPY_META_FIELDS entry, which
+# Match.replace_by_example transfers from the matched node onto every
+# replacement node. Deliberately does not match _HINT_RE, so no spyre_hint
+# consumer (get_op_hints and everything built on it) can mistake it for a
+# hint scope annotation.
+_SCAN_SNAPSHOT_SEQ_KEY = "spyre_scan_snapshot_seq"
+
 
 @torch.compiler.allow_in_graph
 def get_id():
@@ -175,9 +186,15 @@ def _scan_combine_subgraphs(graph: torch.fx.Graph) -> list[torch.fx.GraphModule]
     inner scan subgraph left for this function to miss. If a future torch version
     changes that ordering, re-verify against that test before assuming recursion is
     needed here.
+
+    Each scan node is also stamped with its position in the returned list
+    (see ``_SCAN_SNAPSHOT_SEQ_KEY``): decompose_scan_to_while_loop later
+    replaces each scan with a while_loop and transfers ``meta["custom"]``
+    onto the replacement, and that stamp is what recovery pairs the two on
+    -- see _recover_hop_subgraph_hints.
     """
     assert graph.owning_module is not None
-    subgraphs = []
+    subgraphs: list[torch.fx.GraphModule] = []
     for node in graph.nodes:
         if node.op != "call_function" or node.target is not torch.ops.higher_order.scan:
             continue
@@ -185,6 +202,7 @@ def _scan_combine_subgraphs(graph: torch.fx.Graph) -> list[torch.fx.GraphModule]
         assert isinstance(combine_fn_node, torch.fx.Node) and combine_fn_node.op == (
             "get_attr"
         ), f"{node}: scan's first arg must be a get_attr node, got {combine_fn_node!r}"
+        node.meta.setdefault("custom", {})[_SCAN_SNAPSHOT_SEQ_KEY] = len(subgraphs)
         sub_gm = getattr(graph.owning_module, combine_fn_node.target)
         subgraphs.append(sub_gm)
     return subgraphs
@@ -349,78 +367,87 @@ def _recover_hop_subgraph_hints(
     nodes -- so op targets aren't reliably stable across it (e.g. `reshape`
     can retrace to `view`), and the old combine subgraph is left behind dead
     but not necessarily DCE'd. Both mean we can't identify the right pairing
-    by content or rely on the old node surviving; instead the pairing is
-    positional: decompose_scan_to_while_loop replaces each matched `scan` node
-    in place without reordering matches relative to each other, so the Nth
-    while_loop HOP call node (in graph.nodes order) corresponds to the Nth
-    scan-combine-fn subgraph collect_spyre_hints snapshotted (verified
-    empirically across 1-3 scan sites, including with the two name orders
-    scrambled relative to each other).
+    by content or rely on the old node surviving. Instead each snapshot is
+    paired with its replacement through the ``_SCAN_SNAPSHOT_SEQ_KEY`` stamp
+    collect_spyre_hints left on the scan node: replace_by_example transfers
+    ``meta["custom"]`` (a ``torch.fx.proxy._COPY_META_FIELDS`` entry) from
+    the matched scan node onto the replacement while_loop node, so the stamp
+    survives the retrace even though nothing else about the replacement
+    links back to the scan it came from.
 
-    Matched on the while_loop HOP call itself (its body_fn arg), the same way
-    _scan_combine_subgraphs matches scan calls -- not on "any get_attr named
-    while_loop_body_graph_*": that name is upstream PyTorch's generic naming
-    for every while_loop body, scan-decomposed or not, so a get_attr with no
-    corresponding while_loop call at all (e.g. an unrelated GraphModule
-    attribute that happens to share the name fragment) would inflate
-    body_nodes past subgraph_snapshots and abandon recovery for every real
-    scan site too. This does not fully disambiguate a scan-derived while_loop
-    from a plain, user-authored torch.while_loop call that happens to coexist
-    in the same graph -- decompose_scan_to_while_loop builds the replacement
-    via its own fresh make_fx trace with no identity link back to the
-    original scan node, the same "can't rely on identity surviving" limit
-    this function's own docstring already states for the body subgraph.
-    Narrowing the match to a real while_loop HOP call closes the demonstrated
-    gap (a non-while_loop attribute colliding on name) without claiming to
-    solve that harder, open problem.
+    A while_loop without the stamp is not scan-derived and is ignored,
+    wherever it sits relative to the scans -- most importantly a plain,
+    user-authored ``torch.while_loop``, which traces to exactly this same
+    ``higher_order.while_loop`` call shape. (An earlier version paired the
+    Nth while_loop in graph.nodes order with the Nth snapshot; any such
+    extra loop inflated the count and made recovery abandon every scan in
+    the graph, not just itself.)
 
-    collect_spyre_hints snapshots every scan, hinted or not, so this
-    positional pairing holds even when only some scans in the graph carry a
-    hint -- filtering unhinted ones out there would desync every later index
-    against ``body_nodes`` below, which always has one entry per scan.
+    A stamped while_loop is still shape-checked before use:
+    decompose_scan_to_while_loop always builds its replacement as
+    while_loop(cond_fn, body_fn, carried_inputs) with body_fn a literal
+    get_attr node (torch/_inductor/fx_passes/post_grad.py), so a stamped
+    call without that shape means upstream's construction changed. Skip it
+    -- the coverage check below then abandons recovery -- rather than
+    assert: crashing the whole compile on a merely-unusual while_loop call
+    would be worse than this function's declared failure mode (skip subgraph
+    hint recovery, log, keep compiling) for every other case this pass
+    handles.
+
+    The stamped seqs must exactly cover the snapshots: a missing, extra or
+    duplicated seq -- including zero stamped loops at all, e.g. if a future
+    torch version stops transferring "custom" through replace_by_example --
+    skips recovery with a debug log, the same declared failure mode as a
+    count mismatch. collect_spyre_hints snapshots and stamps every scan,
+    hinted or not, so seq i is always the i-th scan encountered; filtering
+    unhinted scans out anywhere would desync the numbering against
+    ``subgraph_snapshots``.
     """
     if not subgraph_snapshots:
         return
     assert graph.owning_module is not None
 
-    body_nodes: list[torch.fx.Node] = []
+    stamped_bodies: list[tuple[int, torch.fx.Node]] = []
     for node in graph.nodes:
         if (
             node.op != "call_function"
             or node.target is not torch.ops.higher_order.while_loop
         ):
             continue
-        # decompose_scan_to_while_loop always builds its replacement as
-        # while_loop(cond_fn, body_fn, carried_inputs) with body_fn a literal
-        # get_attr node (torch/_inductor/fx_passes/post_grad.py), so a
-        # while_loop call that doesn't have that shape -- body_fn passed as a
-        # kwarg, an inlined callable, a hand-built or otherwise-transformed
-        # graph -- is, by construction, not scan-derived. Skip it rather than
-        # assert: unlike the body subgraph identity problem this function's
-        # own docstring describes (which we can't resolve, only pair
-        # positionally), this is a shape check we CAN make, and getting it
-        # wrong by crashing the whole compile on a merely-unusual while_loop
-        # call would be worse than this function's declared failure mode
-        # (skip subgraph hint recovery, log, keep compiling) for every other
-        # case this pass handles.
+        custom = node.meta.get("custom")
+        if not isinstance(custom, dict) or _SCAN_SNAPSHOT_SEQ_KEY not in custom:
+            # Not scan-derived: the stamp is transferred onto every
+            # replacement decompose_scan_to_while_loop builds, so a
+            # while_loop without one -- e.g. a plain, user-authored
+            # torch.while_loop, which traces to this same call shape --
+            # did not come from a scan and must not consume any scan's
+            # snapshot.
+            continue
+        seq = custom[_SCAN_SNAPSHOT_SEQ_KEY]
+        # type-is-int, not isinstance: bool is an int subclass, and a stray
+        # True would alias seq 1 past the coverage check below.
+        if type(seq) is not int:
+            continue
         if len(node.args) < 2:
             continue
         body_fn_node = node.args[1]
         if not isinstance(body_fn_node, torch.fx.Node) or body_fn_node.op != "get_attr":
             continue
-        body_nodes.append(body_fn_node)
+        stamped_bodies.append((seq, body_fn_node))
 
-    if len(body_nodes) != len(subgraph_snapshots):
+    expected = list(range(len(subgraph_snapshots)))
+    if sorted(seq for seq, _ in stamped_bodies) != expected:
         logger.debug(
-            "recover_spyre_hints: found %d while_loop body subgraph(s) but "
-            "collected %d scan-combine-fn snapshot(s); skipping subgraph "
+            "recover_spyre_hints: found %d stamped while_loop body subgraph(s) "
+            "but collected %d scan-combine-fn snapshot(s); skipping subgraph "
             "hint recovery (mismatched count).",
-            len(body_nodes),
+            len(stamped_bodies),
             len(subgraph_snapshots),
         )
         return
 
-    for body_node, snapshot in zip(body_nodes, subgraph_snapshots):
+    for seq, body_node in stamped_bodies:
+        snapshot = subgraph_snapshots[seq]
         if not any(custom for _, custom in snapshot):
             continue
         sub_gm = getattr(graph.owning_module, body_node.target, None)

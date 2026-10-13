@@ -5138,7 +5138,14 @@ class TestRecoverSpyreHints(unittest.TestCase):
         def find_hinted_nodes(graph_module):
             found = []
             for node in graph_module.graph.nodes:
-                if node.op == "call_function" and node.meta.get("custom"):
+                # Only _hint_* keys are recovered spyre hints:
+                # decompose_scan_to_while_loop also transfers the scan's
+                # _SCAN_SNAPSHOT_SEQ_KEY stamp onto every replacement node
+                # it builds, so "custom is non-empty" alone would count
+                # those too.
+                if node.op == "call_function" and any(
+                    k.startswith("_hint_") for k in node.meta.get("custom") or {}
+                ):
                     found.append(node)
                 if node.op == "get_attr":
                     target = getattr(graph_module, node.target, None)
@@ -5239,8 +5246,16 @@ class TestRecoverSpyreHints(unittest.TestCase):
         every real scan site, not just the unrelated one. Discovery must instead
         match on the while_loop HOP call's own body_fn arg, the same way
         _scan_combine_subgraphs matches scan calls instead of a name substring.
+
+        The while_loop call carries the _SCAN_SNAPSHOT_SEQ_KEY stamp a real
+        scan-derived replacement gets from decompose_scan_to_while_loop's
+        meta["custom"] transfer -- without it, recovery (which pairs on that
+        stamp) would correctly ignore this loop as not scan-derived.
         """
-        from torch_spyre._inductor.propagate_hints import _recover_hop_subgraph_hints
+        from torch_spyre._inductor.propagate_hints import (
+            _SCAN_SNAPSHOT_SEQ_KEY,
+            _recover_hop_subgraph_hints,
+        )
 
         root = torch.nn.Module()
 
@@ -5280,10 +5295,13 @@ class TestRecoverSpyreHints(unittest.TestCase):
         xs = graph.placeholder("xs")
         cond_attr = graph.get_attr("while_loop_cond_graph_0")
         body_attr = graph.get_attr("while_loop_body_graph_0")
-        graph.call_function(
+        while_loop_call = graph.call_function(
             torch.ops.higher_order.while_loop,
             (cond_attr, body_attr, (init, xs)),
         )
+        # The stamp collect_spyre_hints leaves on the scan node, which
+        # decompose_scan_to_while_loop transfers onto this replacement.
+        while_loop_call.meta.setdefault("custom", {})[_SCAN_SNAPSHOT_SEQ_KEY] = 0
         # The decoy is still reachable from the root graph (as any
         # not-yet-DCE'd subgraph would be) but nothing calls it.
         graph.get_attr("unrelated_while_loop_body_graph_decoy")
@@ -5303,6 +5321,139 @@ class TestRecoverSpyreHints(unittest.TestCase):
         )
         self.assertEqual(
             recovered[0].meta["custom"], {"_hint_0": {"work_div": {"K": 2}}}
+        )
+
+    def test_user_while_loop_does_not_block_scan_hint_recovery(self):
+        """A plain, user-authored torch.while_loop coexisting with hinted
+        scans must not consume -- or make recovery abandon -- any scan's
+        hints.
+
+        Pins the PR #5057 follow-up review finding: a user torch.while_loop
+        traces to the same higher_order.while_loop(cond_fn, body_fn,
+        carried) call with get_attr subgraphs that decompose_scan_to_
+        while_loop builds when replacing a scan, so recovery that pairs by
+        position (Nth while_loop in graph.nodes order <-> Nth scan
+        snapshot) counts this extra loop's body too, sees more bodies than
+        snapshots, and skips hint recovery for every scan in the graph.
+        Recovery must instead pair through the spyre_scan_snapshot_seq stamp
+        collect_spyre_hints leaves on each scan -- decompose_scan_to_
+        while_loop transfers meta["custom"] (a torch.fx.proxy._COPY_META_
+        FIELDS entry) from the matched scan node onto the replacement, so
+        the stamp survives the retrace -- and ignore unstamped while_loops
+        entirely, wherever they sit.
+
+        Exercised directly against a hand-built FX graph (no compile): a
+        user torch.while_loop cannot currently compile through the spyre
+        backend at all (standalone it dies on unsupported lesserthan on
+        IEEE_INT32; alongside a scan it crashes lx_context_switching on a
+        buffer with empty origins), so no end-to-end fixture can produce
+        this shape. The loops are built in the exact shape dynamo traces
+        torch.while_loop to. The scan-derived loops are also placed in
+        REVERSED stamp order (seq 1 before seq 0) with different hint
+        contents per snapshot, so a pairing that fell back to encounter
+        order among the stamped loops would cross-assign the snapshots and
+        fail the content asserts below.
+        """
+        from torch_spyre._inductor.propagate_hints import (
+            _SCAN_SNAPSHOT_SEQ_KEY,
+            _recover_hop_subgraph_hints,
+        )
+
+        root = torch.nn.Module()
+
+        def make_body_gm(name: str, op) -> torch.fx.GraphModule:
+            gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+            g = gm.graph
+            carry = g.placeholder("carry")
+            x = g.placeholder("x")
+            out = g.call_function(op, (carry, x))
+            g.output((out, None))
+            gm.recompile()
+            setattr(root, name, gm)
+            return gm
+
+        add_body = make_body_gm("scan_body_add", torch.ops.aten.add.Tensor)
+        sub_body = make_body_gm("scan_body_sub", torch.ops.aten.sub.Tensor)
+        mul_body = make_body_gm("user_body_mul", torch.ops.aten.mul.Tensor)
+        stray_bool_body = make_body_gm("stray_bool_body", torch.ops.aten.mul.Tensor)
+
+        # One cond subgraph shared by all three loops; recovery only inspects
+        # the body_fn arg's shape, and no cond ever executes here.
+        cond_gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        cg = cond_gm.graph
+        cp = cg.placeholder("carry")
+        cg.placeholder("x")
+        lt = cg.call_function(torch.ops.aten.lt.Scalar, (cp, 4))
+        cg.output(lt)
+        cond_gm.recompile()
+        root.shared_cond_graph = cond_gm
+
+        graph = torch.fx.Graph()
+        init = graph.placeholder("init")
+        xs = graph.placeholder("xs")
+        cond_attr = graph.get_attr("shared_cond_graph")
+
+        def add_loop(body_attr_name: str, stamp: int | None) -> None:
+            body_attr = graph.get_attr(body_attr_name)
+            call = graph.call_function(
+                torch.ops.higher_order.while_loop,
+                (cond_attr, body_attr, (init, xs)),
+            )
+            if stamp is not None:
+                call.meta.setdefault("custom", {})[_SCAN_SNAPSHOT_SEQ_KEY] = stamp
+
+        # Graph order: the user loop first, then the scan-derived loops in
+        # reversed stamp order.
+        add_loop("user_body_mul", None)
+        add_loop("scan_body_sub", 1)
+        add_loop("scan_body_add", 0)
+        # A stray boolean stamp: bool is an int subclass and True == 1, so a
+        # validation that only checks isinstance(seq, int) would let it
+        # alias seq 1 past the coverage check (sorted([0, 1, True]) ==
+        # [0, 1]); it must be ignored like an unstamped loop instead.
+        add_loop("stray_bool_body", True)
+        graph.output(())
+
+        gm = torch.fx.GraphModule(root, graph)
+
+        # subgraph_snapshots[i] pairs with the scan stamped seq i: seq 0 is
+        # the add body, seq 1 the sub body.
+        snapshot_add = [
+            (torch.ops.aten.add.Tensor, {"_hint_0": {"work_div": {"K": 2}}})
+        ]
+        snapshot_sub = [
+            (torch.ops.aten.sub.Tensor, {"_hint_0": {"work_div": {"L": 3}}})
+        ]
+        _recover_hop_subgraph_hints(gm.graph, [snapshot_add, snapshot_sub])
+
+        def recovered_custom(body: torch.fx.GraphModule) -> list[dict]:
+            return [
+                n.meta["custom"]
+                for n in body.graph.nodes
+                if n.op == "call_function"
+                and any(k.startswith("_hint_") for k in n.meta.get("custom") or {})
+            ]
+
+        self.assertEqual(
+            recovered_custom(add_body),
+            [{"_hint_0": {"work_div": {"K": 2}}}],
+            "the seq-0 scan's body must recover its own hint",
+        )
+        self.assertEqual(
+            recovered_custom(sub_body),
+            [{"_hint_0": {"work_div": {"L": 3}}}],
+            "the seq-1 scan's body must recover its own hint despite "
+            "preceding the seq-0 loop in graph order",
+        )
+        self.assertEqual(
+            recovered_custom(mul_body),
+            [],
+            "the user while_loop's body must not receive any scan hint",
+        )
+        self.assertEqual(
+            recovered_custom(stray_bool_body),
+            [],
+            "a stray boolean stamp must be ignored, not aliased to seq 1",
         )
 
 
