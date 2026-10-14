@@ -3961,6 +3961,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             relayout_parent_names = [
                 parent for parent in parent_proj if parent not in carry_storage_names
             ]
+            # Merge clone-supplied free divisions BEFORE the call: the
+            # cap-and-rank step inside _cd_parent_relayouts pins the candidate
+            # group that would let a parent join a division another parent
+            # already occupies for free, and an input clone's reusable slot
+            # (#3212) is one such free division -- merged only after the call,
+            # a positive lx_solver_relayout_groups_per_edge cap could prune the
+            # one group matching it and silently drop a residency option
+            # (cyang49's PR #5057 review). The carry branch above has already
+            # run, so the intersection it applies to a carry storage's
+            # match_pairs is unaffected by this merge; the re-merge after
+            # the call below stays for carry storages that only join
+            # parent_proj between the two points.
+            for input_name in parent_proj:
+                if input_name in input_clone_matches:
+                    cd_parent_matches[input_name] = input_clone_matches[input_name][
+                        output_name
+                    ]
             cd_parent_relayouts = self._cd_parent_relayouts(
                 graph,
                 op,
