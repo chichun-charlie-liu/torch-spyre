@@ -32,13 +32,14 @@ into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](wor
 
 In the `torch-spyre` compiler pipeline, work division runs before LX planning, and its
 objective is simply to pick the best parallelization scheme for each op *individually*. But
-consider a simplified program with two memory-bound pointwise ops in a chain: the key
-performance optimization is making sure op1's output stays on each core's own scratchpad for
-op2 to read directly, rather than round-tripping through HBM. Because scratchpad is private per
-core, the data core 0 holds in its scratchpad after op1 must be exactly what core 0 needs for
-op2. If work division splits op1 along rows and op2 along columns, the data op2 needs on a
-given core was never produced on that core — so op1's output has to spill to HBM, and every
-core processing op2 pays the slower HBM fetch to get its share.
+consider a simplified program with two memory-bound pointwise ops in a chain: because scratchpad
+is private per core, the key performance optimization is making sure op1's output is already
+exactly where op2 needs it on each core's own scratchpad — not moved there after the fact,
+whether through an HBM round trip or an explicit relayout copy between cores, since both are
+real options but neither is free. That means the data core 0 holds in its scratchpad after op1
+must be exactly what core 0 needs for op2. An awkward work division breaks this: if op1 splits
+along rows and op2 along columns, the data op2 needs on a given core was never produced on
+that core, and moving it there is the extra runtime cost this section is about.
 
 Solving work division and LX placement one at a time, freezing the earlier choice before the
 later pass runs, leaves exactly this interaction on the table: either compute utilization is
@@ -50,24 +51,39 @@ combined space instead of two disjoint ones.
 
 ## How it works in general
 
-In a nutshell, the co-optimizer uses a cost model to estimate two things per candidate: the
-runtime of matmul compute (the only op type with its own compute-roofline term; a dependent
-fused reduction riding in the same bundle as a matmul gets a smaller additive correction, and
-every other op is treated as pure memory traffic) and the data-transfer time implied by where
-each buffer lives (HBM or LX), using known or measured bandwidth for the target hardware.
-Rather than committing to one work division per op up front, it evaluates several combinations
-together and prices the communication cost that each one implies, then commits only the
-winning combination at the end of the search. A few different solver backends can drive this
-search; the sections below cover each in detail, and [Cost model](#cost-model) covers the
-model itself — how it plugs into the solvers, how to inspect it, and how to recalibrate it.
+In a nutshell, the co-optimizer relies on a cost model to estimate the overall compute cost and
+communication cost of a given set of work division choices. Matmul compute is the only op type
+with its own compute-roofline term — a dependent fused reduction riding in the same bundle as a
+matmul gets a smaller additive correction — while every other op is treated as pure memory
+traffic. The data-transfer time is estimated by where each buffer lives (HBM or LX), using known
+or measured bandwidth for the target hardware. Rather than committing to one work division per
+op up front, it evaluates several combinations together and prices the communication cost that
+each one implies, then commits only the winning combination at the end of the search. A few
+different solver backends can drive this search; the sections below cover each in detail, and
+[Cost model](#cost-model) covers the model itself — how it plugs into the solvers, how to
+inspect it, and how to recalibrate it.
 
 The co-optimizer is reached through `CoOptimizingAllocator`
 (`torch_spyre/_inductor/scratchpad/allocator.py`), gated by `config.co_optimizing_lx_planning`
-(env `CO_OPTIMIZING_LX_PLANNING`, on by default) and selected via `config.layout_solver`. It
-runs as a **pre-scheduling pass** — `V.graph` is live but `V.graph.scheduler` is still `None`,
-so fusion hasn't happened yet and anything the engine needs to know about the kernels its
-decisions will land in has to be *estimated* from the flat, ordered operation list rather than
-read off the real fused grouping.
+(env `CO_OPTIMIZING_LX_PLANNING`, **on by default**) and selected via `config.layout_solver`. It
+runs as a pre-scheduling pass: `V.graph` is live but `V.graph.scheduler` is still `None`, so
+fusion hasn't happened yet. The cost model therefore can't read a kernel's real fused grouping
+off the scheduler — it has to *estimate* one from the flat, ordered operation list instead.
+Without `co_optimizing_lx_planning`, each solver can still be selected on its own, but then it
+only *places* buffers against divisions some earlier pass already fixed — it never searches
+divisions itself. The joint behavior is what `CoOptimizingAllocator` adds on top.
+
+`layout_solver`'s options are `"cpsat"`, `"simulated_annealing"`, `"greedy"`, `"firstfit"`, and
+`"bestfit"`, but only `"simulated_annealing"`, and `"cpsat"` *with `ortools` installed*, are
+natively core-division-capable and reach a purpose-built joint solver directly.
+`select_allocator()` rejects every other combination by default and raises `ValueError`
+**unless** `config.allow_exhaustive_search` (env `ALLOW_EXHAUSTIVE_SEARCH`) is also set, in
+which case `ExhaustiveSearchSolver` will perform a DFS search over
+`greedy`'s own division menu (see details below). **Note this DFS is exponential** — `K^N`
+leaves over the `N` buffers with a real choice — **and has no size cap or timeout of its own.**
+The reject-by-default behavior above is the only guard against that blow-up, so only opt in on
+a task small enough for the exponential compile-time cost to be acceptable. This fallback is
+not a general substitute for CP-SAT or SA.
 
 ### The simplest version: exhaustive search over greedy placement
 
@@ -75,12 +91,12 @@ Before getting into the production solvers, it's worth seeing the simplest possi
 of "co-optimize divisions and placement jointly," because it makes the shape of the problem
 concrete without any annealing or constraint-solving machinery to explain first.
 
-`ExhaustiveSearchSolver` (`torch_spyre/_inductor/scratchpad/exhaustive_search.py`) wraps a
-plain, placement-only solver — most simply `GreedyLayoutSolver`, which otherwise only ever
-places buffers against divisions some earlier pass already fixed — and brute-forces the other
-half of the problem around it. For every buffer that has more than one candidate division, it
-tries every combination (an exhaustive DFS, bounded by `K^N` leaves over the `N` buffers that
-actually have a choice), and at each leaf:
+`ExhaustiveSearchSolver` (`torch_spyre/_inductor/scratchpad/exhaustive_search.py`) wraps the
+simplest placement-only solver, `GreedyLayoutSolver`, and brute-forces the other half of the
+problem — searching — around it. For every buffer it generates a few legitimate candidate
+division choices, then tries every combination with an exhaustive DFS, bounded by `K^N` leaves
+where `N` is the number of buffers with a real choice and `K` is each one's candidate count. At
+each leaf:
 
 1. Builds a fresh set of per-core buffer sizes implied by that combination of chosen divisions.
 2. Hands them to a brand-new instance of the wrapped placement solver (a solver is single-use)
@@ -90,36 +106,50 @@ actually have a choice), and at each leaf:
    fallback uses.
 
 The combination with the lowest score wins; its divisions are committed to every buffer, and
-the wrapped solver runs once more to produce the final addresses.
+the wrapped solver runs once more to produce the final LX/HBM addresses.
 
 For example: a producer with 2 candidate divisions feeding a consumer with 2 of its own is a
 `2×2 = 4`-leaf DFS. Say only one of those four pairings avoids a `core_div_mismatch` between
-them (`cd_parent_matches` — the same relation the production solvers use to decide which
-combinations even make a buffer LX-eligible, not a check bolted on separately here). The three
-mismatched leaves each spill one buffer to HBM and score accordingly; the matching leaf scores
-zero (both pin). `ExhaustiveSearchSolver` tries all four, keeps the zero-scoring one, and
-commits its divisions.
+them, per `_cd_parent_matches()` (`allocator.py`) — the same relation the production solvers use
+to decide which combinations even make a buffer LX-eligible via its `cd_parent_matches` field,
+not a check bolted on separately here. The three mismatched leaves each spill one buffer to HBM
+and score accordingly; the matching leaf scores zero (both pin). `ExhaustiveSearchSolver` tries
+all four, picks the lowest-scoring leaf as the winner, and commits its divisions.
 
-This also shows why it's not what ships by default: scoring a leaf means re-running the real
-placement solver from scratch, so the cost is exponential in the number of buffers with a
-real choice. `select_allocator()` only reaches for `ExhaustiveSearchSolver` as a fallback —
-when `co_optimizing_lx_planning` is set but the configured `layout_solver` has no
-purpose-built core-division-capable solver to co-optimize with (i.e. anything other than
+Note this is a simplified scoring which only ever counts unpinned-HBM bytes — there is no
+compute-cost term anywhere in this solver (`plan_layout_and_core_divisions` even carries a
+`# TODO: use cost_expr here`), and it never generates a division of its own: it only indexes
+into the candidate divisions each buffer already carries in from the upstream work-division
+pass. So this simplest version implicitly assumes those upstream divisions are already the
+right call for each buffer's compute shape, and only searches for the pairing that keeps the
+most of them resident. For a memory-bound graph that's not always true: a division that's
+suboptimal for one op's matmul utilization could still lower the *overall* cost if it lets a
+shared buffer stay pinned, but this solver has no way to see that trade-off or reach for such a
+division unless it happens to already be on the menu. The production solvers below close part
+of this gap — CP-SAT and SA both weigh a compute-roofline term alongside HBM traffic — but even
+they choose only among divisions `enumerate_work_division_candidates()` offers, not an unbounded
+search over every possible division.
+
+This also shows why `ExhaustiveSearchSolver` isn't what ships by default: the compile-time cost
+is exponential in the number of buffers with a real choice. `select_allocator()` only reaches for
+it as a fallback — when `co_optimizing_lx_planning` is set but the configured `layout_solver`
+has no purpose-built core-division-capable solver to co-optimize with (i.e. anything other than
 `"cpsat"` with `ortools` installed, or `"simulated_annealing"`) — and only when the caller has
 opted in via `config.allow_exhaustive_search` (env `ALLOW_EXHAUSTIVE_SEARCH`); otherwise it
-raises rather than silently paying that cost. The two solvers below exist to make the general
-case affordable for the common case; the rest of this section covers how the fallback itself
+raises rather than silently paying that cost. The two production solvers below exist to make
+the common case affordable; the rest of this section covers how `ExhaustiveSearchSolver` itself
 is kept affordable when it does run.
 
 **Pruning the DFS's candidate menu: `_enum_split_options`.** The example above assumed each
-buffer's menu was already small (2 candidates). In practice `select_allocator()` always pairs
-`ExhaustiveSearchSolver` with `CoOptimizingAllocator(prune=True)`, which controls exactly that
-menu: instead of `enumerate_work_division_candidates()`'s full, standalone-work-division-planner
-cross product, `_enum_split_options` (`allocator.py`) builds a much smaller, heuristic
-candidate list per op, dispatching on op type — the difference between a `2×2`-leaf DFS and
-one with every legal division for every buffer. CP-SAT and SA never set `prune=True` — this
-pruning exists specifically to keep *this* DFS's exponential cost affordable, not as a third
-solving strategy alongside them.
+buffer's candidate list — its "menu" — was already small (2 candidates). In practice,
+`select_allocator()` always pairs `ExhaustiveSearchSolver` with
+`CoOptimizingAllocator(prune=True)`, which controls exactly that menu: instead of
+`enumerate_work_division_candidates()`'s full, standalone-work-division-planner cross product,
+`_enum_split_options` (`allocator.py`) builds a much smaller, heuristic candidate list per op,
+dispatching on op type — the difference between a `2×2`-leaf DFS and one with every legal
+division for every buffer. CP-SAT and the SA solver never set `prune=True`; this pruning exists
+specifically to keep *this* DFS's exponential cost affordable, not as a third solving strategy
+alongside them.
 
 :::{figure} ../_static/images/lx/co-optimization.svg
 :alt: Co-optimization searches over alternative split assignments, scoring each by HBM bytes left unpinned
@@ -131,58 +161,19 @@ bytes the solver could not pin, and commits the winning assignment back before t
 allocator flow.
 :::
 
-Generated alternatives are deduped by canonical key and filtered through `_split_fits_sticks`,
-which rejects factors that overflow a stickified dim's stick count (those would abort the
-SuperDSC bundler) or that land on a collapsed/broadcast dim. The upstream seed is always kept
-and is already stick-valid from work division; every other candidate must still satisfy hard
-work-division constraints (blocked axes stay unsplit, split domains restrict legal factors).
+Generated alternatives are deduped and filtered down to ones that are actually legal (no
+stick-count overflow, no collapsed/broadcast dims, hard work-division constraints respected).
+Within that, pointwise ops get a handful of dim-flip variants and matmuls get each other's
+splits and a shared batch-major option, so that reconciling buffers across ops stays possible
+without blowing up the per-op menu size — the specific heuristics mirror the kind of
+compute-vs-locality trade-off [Why a co-optimizer](#why-a-co-optimizer) motivates, just applied
+per op type here instead of jointly. The leaf-scoring function is the same one described above
+(`_generate_buffers + plan_layout`, scored by unpinned HBM bytes), with some of its repeated
+work memoized across leaves.
 
-- **Pointwise ops** get their seed, dim-flip variants (move the seed's single output-dim
-  factor onto each compatible alternative output dim, bounded by `DEFAULT_VARIANT_CAP = 6`),
-  and the matmul tilings from the shared pool (below). Adopting a neighbouring matmul's tiling
-  makes the op's per-core view match the matmul's, so a shared buffer pins to LX *and* the op
-  runs at the matmul's high-utilization shape.
-- **Matmul splits are not overridden onto a single dim, but neighbours' tilings and a
-  batch-major split are offered.** Concentrating a balanced `M/4×N/8` split onto one dim
-  (`M/32`) pins the matmul output and the surrounding chain to LX but is a poor matmul shape:
-  on `mlp-linear-kn.t` (`SENCORES=32`) it regressed kernel time ~2.5× as process-engine
-  utilization fell from 66% to 33%. So the rule remains **prioritize compute utilization for
-  compute-bound ops**: the seed split is never flipped onto one dim. Instead,
-  `_check_and_add_matmul_option` offers each matmul its seed plus (a) every *other* matmul's
-  split transferred into this op's coordinates by axis role (so two matmuls whose
-  work-division splits disagree can find a consistent assignment), and (b) a factored
-  batch-major `B/M` split. All of these are full-core splits, so compute utilization is
-  preserved.
-- **Batch-major `B/M` tiling reconciles attention.** Two attention matmuls (`Q·Kᵀ` and
-  `scores·V`) contract different axes, so neither can adopt the other's `N`/`K` tiling, but
-  both keep the batch (`B`) and `M` output axes. `_factored_bm_splits` emits a single full-core
-  `B/b · M/m` split (largest batch factor that fits, from `(8, 4, 2)` with `m = ncores / b`),
-  valid for both matmuls and divisible into both stick-count extents. This shared tiling is
-  also offered to the **softmax reductions** (`max`/`sum`) in their own output coordinates via
-  `_reduction_bm_axes`. Reductions are otherwise left on their seed, but offering them the
-  `B/M` split lets the whole softmax chain between the two matmuls reconcile to one tiling. On
-  `mha_4h` (`SENCORES=32`) this converges both matmuls and the entire softmax chain on
-  `B/4·M/8`, pinning the scores matrix and the chain to LX. Reductions are not given dim-flip
-  variants (their reduced axis is fixed), and any candidate that fails to reconcile a shared
-  buffer's per-core view self-eliminates during scoring.
-
-The shared matmul-tiling pool is collected once by `_find_distinct_matmul_splits`: each
-distinct matmul seed split plus each matmul's factored `B/M` split, deduped. This pool seeds
-both the pointwise candidate lists and the cross-matmul transfer.
-
-On `mlp-linear-kn.t` (`SENCORES=32`) the pointwise-seeding path lifted process-engine
-utilization from ~66% to ~79% and cut fused kernel time by ~17% (about 2× faster than the
-sendnn reference).
-
-The leaf-scoring function itself is the same one described above: it runs the full
-`_generate_buffers + plan_layout` pass on the candidate splits and counts the HBM bytes of
-every buffer the solver could not pin. Repeated `_per_core_view_on_buf` work is memoized
-across leaves, and the split-invariant liveness / filtered-op-view / mem-usage computations
-are hoisted out of the per-leaf path.
-
-The factored-`B/M` and cross-matmul transfer options are marked TEMP/TODO: the intent is for
-work division to assign consistent splits directly, at which point these compensating options
-can be removed. See [Co-optimization is still limited](scratchpad_planning.md#co-optimization-is-still-limited)
+These heuristics are marked TEMP/TODO: the intent is for work division to assign consistent
+splits directly, at which point they can be removed. See
+[Co-optimization is still limited](scratchpad_planning.md#co-optimization-is-still-limited)
 for the remaining gaps in this path.
 
 ### The production solvers
@@ -208,47 +199,56 @@ the same inputs and the same cost model:
   worse than the seed. See [Joint core-division + LX placement](sa_co_optimization.md) for the
   full mechanics.
 
-**What "co-optimizing" means concretely**: both solvers are driven by a *single* cost
-expression (`cost_expr`) built once, up front, from the whole graph's predicted runtime —
-`predict_by_bundle(graph.operations, op_features, ...)`, a symbolic expression over every
-buffer's `sym_is_lx` (is it LX-resident) and `sym_core_divs` (which division was chosen).
-Because both kinds of decision are symbols in the *same* expression, a move that changes one
-automatically re-prices the other — there's no separate objective per variable to reconcile
-after the fact. That's what distinguishes this from running two independent passes in
-sequence. When no cost expression is usable (symbolic shapes, serialized captures, or a
-construction error), both solvers fall back to a cheaper **memory-only** objective: pure
-differential HBM traffic, where a resident buffer costs zero and only spills are summed. This
-fallback is weaker — on a graph where everything already fits, every division scores
-identically and the search has nothing left to optimize on.
+### Symbolic cost formula
 
-Without `co_optimizing_lx_planning`, each solver can still be selected on its own, but then it
-only *places* buffers against divisions some earlier pass already fixed — it never searches
-divisions itself. The joint behavior is what `CoOptimizingAllocator` adds on top.
+Both production solvers are driven by a *single* cost expression (`cost_expr`), built once, up
+front, by `predict_by_bundle(graph.operations, op_features, ...)`. It's a sympy expression over
+two kinds of symbol, one pair per buffer: `sym_is_lx` (1 if the buffer ends up LX-resident, 0 if
+it spills to HBM) and `sym_core_divs` (which division was chosen). `predict_ops`'s real model
+has many more terms (turnaround, replicated-read pricing, access-pattern bandwidth overrides,
+and per-bundle dedup for a graph-boundary input a fused kernel's clone-in loads only once — see
+its docstring); simplified down to the shape that matters for co-optimization:
+
+```python
+# Build: walk the graph once, symbols only, nothing bound yet.
+cost_expr = 0
+for op in ops:
+    for buf in op.reads_and_writes:
+        cost_expr += (1 - sym_is_lx(buf)) * size(buf, sym_core_divs(buf)) / bandwidth
+    cost_expr += compute_cost(op, sym_core_divs) if op_is_matmul(op) else 0
+
+# Search: each candidate binds every buffer's symbols at once, then
+# evaluates the SAME cost_expr under that one joint guess.
+for candidate in candidates:  # CP-SAT's own solver vars, or SA's (chosen, placement) state
+    bindings = {sym: candidate[sym] for sym in cost_expr.free_symbols}
+    real_cost = cost_expr.xreplace(bindings).evalf()
+    if real_cost < best_cost:
+        best_cost, winner = real_cost, candidate
+```
+
+During the build phase, the inner sum is a buffer's own HBM term, linear in `sym_is_lx` and
+zero once it's pinned. `compute_cost` is zero for every op except a matmul, which adds its
+roofline term keyed off the same `sym_core_divs`. The whole graph's `cost_expr` is just this
+double sum, built once as pure symbols before any decision is made. The search phase never
+changes that expression; it instead scores each candidate by substituting its guess into
+`cost_expr` and evaluating — CP-SAT's own decision variables, or SA's `(chosen, placement)`
+state, are a *different* representation of the same decisions. Once a winner is picked, only
+its guess is ever written back onto the buffers (as `.address` and `.chosen_division`), which
+is what finally pins down what `sym_is_lx` and `sym_core_divs` turned out to mean for that
+buffer.
+
+When no cost expression is usable (symbolic shapes, serialized captures, or a construction
+error), both solvers fall back to a cheaper **memory-only** objective: pure differential HBM
+traffic, where a resident buffer costs zero and only spills are summed — the compute-roofline
+term drops out entirely. This fallback is weaker — on a graph where everything already fits,
+every division scores identically and the search has nothing left to optimize on.
 
 ## What gets co-optimized
 
-**Controlling it**: two flags gate everything below, for both subsections.
-
-- `config.co_optimizing_lx_planning` (env `CO_OPTIMIZING_LX_PLANNING`, **on** by default):
-  the on/off switch. Off, every variable here goes back to being decided by its own
-  standalone pass, nothing joint.
-- `config.layout_solver` (env `LAYOUT_SOLVER`, default `"cpsat"`): which solver runs the
-  joint search. Options are `"cpsat"`, `"simulated_annealing"`, `"greedy"`, `"firstfit"`, and
-  `"bestfit"` — but only `"simulated_annealing"`, and `"cpsat"` *with `ortools` installed*,
-  are natively core-division-capable and reach a purpose-built joint solver directly.
-
-Every other case — `"greedy"`, `"firstfit"`, `"bestfit"`, or `"cpsat"` without `ortools` —
-has no core-division-capable solver to co-optimize with, so `select_allocator()` **rejects it
-by default**: it raises `ValueError` unless `config.allow_exhaustive_search` (env
-`ALLOW_EXHAUSTIVE_SEARCH`) is also set, in which case it falls back to the
-`ExhaustiveSearchSolver` DFS from
-[The simplest version](#the-simplest-version-exhaustive-search-over-greedy-placement) above.
-So `layout_solver="greedy"` with `co_optimizing_lx_planning` left on doesn't just place
-buffers once `allow_exhaustive_search` is set — it drives that DFS over `greedy`'s own
-division menu. **That DFS is exponential** (`K^N` leaves over the `N` buffers with a real
-choice) **and has no size cap or timeout of its own** — the reject-by-default behavior above
-is the only guard, so only opt in on a task small enough that the exponential blow-up is
-acceptable, not as a general substitute for CP-SAT or SA.
+**Controlling it**: the same two flags gate everything below, for both subsections —
+`config.co_optimizing_lx_planning` and `config.layout_solver` — see
+[How it works in general](#how-it-works-in-general) for their options, and for what happens
+with a non-core-division-capable `layout_solver` and the `ExhaustiveSearchSolver` fallback.
 
 ### a) LX placement and work division
 
