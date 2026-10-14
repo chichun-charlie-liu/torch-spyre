@@ -45,6 +45,7 @@ import operator
 import unittest
 from unittest import mock
 
+import pytest
 import torch
 from torch._inductor.virtualized import V
 
@@ -4061,7 +4062,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from for_each_tile_fixtures import (
@@ -4103,7 +4103,6 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         """
         import torch
         import torch_spyre  # noqa: F401
-        import pytest
         from torch._inductor.exc import InductorError
         from torch_spyre.constants import DEVICE_NAME
         from for_each_tile_fixtures import (
@@ -5110,23 +5109,32 @@ class TestRecoverSpyreHints(unittest.TestCase):
             )
 
     def test_nested_scan_hint_recovers(self):
-        """A spyre_hint inside a nested for_each_tile's INNER body still survives
-        to the final compiled graph.
+        """A spyre_hint inside a nested for_each_tile's INNER body survives to
+        the final compiled graph.
 
-        Pins cyang49's PR #5057 review inference that nested scan subgraphs might
-        not be discovered recursively (collect_spyre_hints/_scan_combine_subgraphs
-        only walk a graph's own direct call_function nodes, not into a reached
-        subgraph). Verified empirically (see _scan_combine_subgraphs's docstring):
-        by the time the outer scan's combine-fn is snapshotted, the inner scan
-        has already decomposed into its own while_loop, so there is no pending
-        inner *scan* subgraph for a root-level-only walk to miss -- the inner
-        for_each_tile's own collect/recover cycle (running before the outer one)
-        is what actually carries this hint through. This test pins the
-        end-to-end outcome rather than the internal mechanism, so it still catches
-        a regression if a future torch version changes that ordering.
+        The inner for_each_tile is compiled as its own unit and embedded as FX
+        in the outer combine-fn; its collect_spyre_hints ran but its
+        recover_spyre_hints never did (only the outermost compile reaches the
+        scheduler where recovery lives), so the outer compile's collect first
+        recovers those orphaned snapshots -- before its own
+        decompose_scan_to_while_loop retrace, which then copies the recovered
+        custom meta into the active replacement bodies.
+
+        Counts hints ONLY inside active replacement bodies (while_loop bodies
+        whose call carries the _SCAN_SNAPSHOT_SEQ_KEY stamp, recursively): the
+        pre-decomposition combine subgraphs stay behind as dead-but-not-DCE'd
+        modules that still carry _hint_* metadata (their own originals, plus
+        the dead-side copies the orphan recovery writes), so a graph-wide
+        get_attr walk could satisfy the count without the live bodies
+        recovering anything. That is not hypothetical -- it is exactly how
+        this test passed before the orphan recovery existed (cyang49's PR
+        #5057 review inference, confirmed empirically: the graph-wide walk
+        found both hinted nodes in the dead inner combine module while the
+        active bodies held zero).
         """
         import torch_spyre  # noqa: F401  registers the "spyre" device
         from torch_spyre.constants import DEVICE_NAME
+        from torch_spyre._inductor.propagate_hints import _SCAN_SNAPSHOT_SEQ_KEY
 
         from for_each_tile_fixtures import M, K, N, nested_split_m_then_k_hinted_fn
 
@@ -5136,21 +5144,41 @@ class TestRecoverSpyreHints(unittest.TestCase):
         _out, gm = capture_post_grad_while_loop(nested_split_m_then_k_hinted_fn, (X, Y))
 
         def find_hinted_nodes(graph_module):
+            # Walk only ACTIVE replacement bodies: a while_loop call carrying
+            # the stamp is scan-derived (the stamp rides replace_by_example's
+            # meta["custom"] transfer), so its body is live; recursion goes
+            # through stamped bodies only, never through the dead combine
+            # modules a graph-wide get_attr walk would also reach.
+            #
+            # The stamped-body target set must be complete BEFORE the
+            # recursion pass: a while_loop's body_fn get_attr precedes its
+            # call in FX node order, so building the set and recursing in one
+            # pass would skip every stamped body.
+            stamped_body_targets = {
+                node.args[1].target
+                for node in graph_module.graph.nodes
+                if node.op == "call_function"
+                and node.target is torch.ops.higher_order.while_loop
+                and isinstance(node.meta.get("custom"), dict)
+                and _SCAN_SNAPSHOT_SEQ_KEY in node.meta["custom"]
+                and len(node.args) > 1
+                and isinstance(node.args[1], torch.fx.Node)
+                and node.args[1].op == "get_attr"
+            }
             found = []
             for node in graph_module.graph.nodes:
-                # Only _hint_* keys are recovered spyre hints:
-                # decompose_scan_to_while_loop also transfers the scan's
-                # _SCAN_SNAPSHOT_SEQ_KEY stamp onto every replacement node
-                # it builds, so "custom is non-empty" alone would count
+                # Only _hint_* keys are recovered spyre hints: replacement
+                # nodes also carry the _SCAN_SNAPSHOT_SEQ_KEY stamp in their
+                # custom dict, so "custom is non-empty" alone would count
                 # those too.
                 if node.op == "call_function" and any(
                     k.startswith("_hint_") for k in node.meta.get("custom") or {}
                 ):
                     found.append(node)
-                if node.op == "get_attr":
-                    target = getattr(graph_module, node.target, None)
-                    if isinstance(target, torch.fx.GraphModule):
-                        found.extend(find_hinted_nodes(target))
+                if node.op == "get_attr" and node.target in stamped_body_targets:
+                    body = getattr(graph_module, node.target, None)
+                    if isinstance(body, torch.fx.GraphModule):
+                        found.extend(find_hinted_nodes(body))
             return found
 
         hinted_nodes = find_hinted_nodes(gm)
@@ -5158,8 +5186,8 @@ class TestRecoverSpyreHints(unittest.TestCase):
             len(hinted_nodes),
             2,
             "expected the inner for_each_tile's acc + x @ y to recover its "
-            "hint on both aten.mm.default and aten.add.Tensor, at any "
-            "nesting depth",
+            "hint on both aten.mm.default and aten.add.Tensor inside the "
+            "active replacement bodies",
         )
         for n in hinted_nodes:
             self.assertEqual(

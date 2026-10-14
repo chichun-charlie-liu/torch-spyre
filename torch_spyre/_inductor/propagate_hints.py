@@ -180,12 +180,14 @@ def _scan_combine_subgraphs(graph: torch.fx.Graph) -> list[torch.fx.GraphModule]
     Only ``graph``'s own direct call_function nodes are considered -- a nested
     for_each_tile's inner scan, reached through this scan's own combine_fn subgraph,
     is not walked into here. Empirically (verified via a real nested-for_each_tile
-    compile, see TestRecoverSpyreHints.test_nested_scan_hint_recovers), by the time an
-    outer scan's combine_fn is snapshotted, Inductor has already fully decomposed any
-    inner scan reached through it into its own while_loop -- so there is no pending
-    inner scan subgraph left for this function to miss. If a future torch version
-    changes that ordering, re-verify against that test before assuming recursion is
-    needed here.
+    compile), by the time an outer scan's combine_fn is snapshotted, Inductor has
+    already fully decomposed any inner scan reached through it into its own
+    while_loop -- so there is no pending inner scan subgraph left for this
+    function to miss. The inner level was compiled as its own unit first, and
+    *that* compile's collect_spyre_hints snapshotted its combine; those snapshots
+    ride along, unrecovered, on the module embedded as this scan's combine-fn,
+    and _recover_orphaned_hints -- run at this, the next level's collect --
+    recovers them before this compile's own decomposition retrace.
 
     Each scan node is also stamped with its position in the returned list
     (see ``_SCAN_SNAPSHOT_SEQ_KEY``): decompose_scan_to_while_loop later
@@ -235,6 +237,13 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     the old combine subgraph is left behind, dead but not yet DCE'd, so we
     snapshot it here rather than rely on it surviving to recovery time. See
     recover_spyre_hints for how these snapshots get matched back up.
+
+    Before taking this compile's own snapshots, first recovers any orphaned
+    snapshots that modules reachable from this graph still carry from earlier,
+    unscheduled compiles (see ``_recover_orphaned_hints``): a nested
+    for_each_tile's inner levels run collect but never recover on their own,
+    and this is the one point where their recovery is both possible and
+    still useful.
     """
     assert graph.owning_module is not None
 
@@ -242,6 +251,12 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     if graph.owning_module.meta.get("__spyre_dim_hints") is None:
         graph.owning_module._register_create_node_hook(log_new_nodes)
 
+        # Before this compile's own snapshot writes: recover snapshots left
+        # behind by embedded, never-scheduled compiles. Must precede the meta
+        # stores below -- the walk starts at this module, so once its own
+        # snapshot is stored the walk would consume it here instead of leaving
+        # it for recover_spyre_hints at scheduler time.
+        _recover_orphaned_hints(graph.owning_module)
         snapshot = [
             (node.target, node.meta.get("custom"))
             for node in graph.nodes
@@ -470,6 +485,72 @@ def _recover_hop_subgraph_hints(
             )
 
 
+def _recover_collected_hints(gm: torch.fx.GraphModule) -> bool:
+    """Apply ``gm``'s own collect-time snapshots (flat + per-scan-combine) to
+    its current graph, popping both meta keys. Returns False, touching
+    nothing, if ``gm`` never ran collect_spyre_hints.
+
+    Extracted from recover_spyre_hints so the orphan walk below can run the
+    exact same recovery on modules it did not reach through a scheduler.
+    """
+    if "__spyre_dim_hints" not in gm.meta:
+        return False
+    _dim_hints = gm.meta.pop("__spyre_dim_hints")
+    subgraph_snapshots = gm.meta.pop("__spyre_dim_hints_subgraphs", [])
+    nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
+    matched, hinted = _apply_snapshot(nodes, _dim_hints)
+    if matched < hinted:
+        logger.debug(
+            "_recover_collected_hints: on %s, matched %d/%d hinted snapshot "
+            "entries; %d entries were for nodes removed by post-grad passes.",
+            gm._get_name(),
+            matched,
+            hinted,
+            hinted - matched,
+        )
+    _recover_hop_subgraph_hints(gm.graph, subgraph_snapshots)
+    return True
+
+
+def _recover_orphaned_hints(root_gm: torch.fx.GraphModule) -> None:
+    """Recover snapshots left behind by embedded, never-scheduled compiles.
+
+    A nested for_each_tile's inner levels are compiled as their own units and
+    then embedded as FX submodules of the next level's combine-fn; only the
+    outermost compile ever reaches ``GraphLowering._update_scheduler``, where
+    recover_spyre_hints runs. Every inner level's collect-time snapshot is
+    therefore taken and then orphaned -- still carried, unpopped, on the
+    embedded module itself.
+
+    This runs at the *next* level's collect, the one window where recovery is
+    both possible (the inner compile has fully finished, so the stamped
+    while_loop replacements its snapshots pair against already exist) and
+    useful (this compile's own decompose_scan_to_while_loop retrace, which
+    copies custom meta into the replacement bodies, has not run yet). The
+    unpopped ``__spyre_dim_hints`` key is the marker: a compile that did run
+    recover -- any normally-scheduled one -- has already popped it, so this
+    walk is idempotent and never double-applies.
+
+    Pairing stays scoped to each orphaned module's own graph and snapshot
+    list, so scan-stamp sequence numbers -- numbered per compile and hence
+    colliding across levels -- never mix.
+    """
+    seen: set[int] = set()
+    pending = [root_gm]
+    while pending:
+        gm = pending.pop()
+        if id(gm) in seen:
+            continue
+        seen.add(id(gm))
+        _recover_collected_hints(gm)
+        for node in gm.graph.nodes:
+            if node.op != "get_attr":
+                continue
+            child = getattr(gm, node.target, None)
+            if isinstance(child, torch.fx.GraphModule):
+                pending.append(child)
+
+
 def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     """
     Restore custom meta on AOT-renamed call_function nodes by aligning the
@@ -501,18 +582,4 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     if log_new_nodes in graph.owning_module._create_node_hooks:
         graph.owning_module._unregister_create_node_hook(log_new_nodes)
 
-    _dim_hints = graph.owning_module.meta.pop("__spyre_dim_hints")
-    subgraph_snapshots = graph.owning_module.meta.pop("__spyre_dim_hints_subgraphs", [])
-    nodes = [n for n in graph.nodes if n.op == "call_function"]
-
-    matched, hinted = _apply_snapshot(nodes, _dim_hints)
-    if matched < hinted:
-        logger.debug(
-            "recover_spyre_hints: matched %d/%d hinted snapshot entries; "
-            "%d entries were for nodes removed by post-grad passes.",
-            matched,
-            hinted,
-            hinted - matched,
-        )
-
-    _recover_hop_subgraph_hints(graph, subgraph_snapshots)
+    _recover_collected_hints(graph.owning_module)
