@@ -593,8 +593,9 @@ loud warning instead of a quietly wrong measurement.
 
 Open items from drafting this page that are worth resolving before calling it done:
 
-- CP-SAT's coarse-tiling stack landed first (`#4768`), updating [c) Coarse
-  tiling](#c-coarse-tiling) above accordingly. SA's stack (`pr-4456` through `pr-4894`) is
+- CP-SAT's coarse-tiling stack landed first (`#4768`), updating [b) LX placement, work
+  division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling) above
+  accordingly. SA's stack (`pr-4456` through `pr-4894`) is
   still pending — update that section again once it lands rather than leaving CP-SAT's
   landed/SA's pending split stale the way `scratchpad_planning.md`'s own "Current
   limitations"/"Future work" lists were left after `#4768` (flagged above).
