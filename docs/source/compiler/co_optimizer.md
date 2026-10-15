@@ -21,7 +21,7 @@ into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](wor
 
 - [Why a co-optimizer](#why-a-co-optimizer)
 - [How it works in general](#how-it-works-in-general)
-- [What gets co-optimized](#what-gets-co-optimized)
+- [What gets co-optimized today](#what-gets-co-optimized)
   - [LX placement and work division](#a-lx-placement-and-work-division)
   - [LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
 - [Cost model](#cost-model)
@@ -48,6 +48,37 @@ either case, joint assignments that *reconcile* several ops onto one shared divi
 that keeps everyone's compute shape good **and** keeps the shared buffer resident — are missed
 simply because the earlier pass already committed. The co-optimizer exists to search that
 combined space instead of two disjoint ones.
+
+### A simplified example of core division choices on buffer residency
+
+Take `X - X.max(dim=0)`, a 2-op chain (`max(dim=0)` into `sub`, with input `X` feeding both).
+Two cores will be used for each op, with a pre-determined work division setting for each. For
+example, an input buffer of shape `M x N` with `max` set to split by columns has core0 read and
+process the first half of the buffer (`M x N/2`) while core1 handles the other half. If the
+columns each core needs are already pinned on that core's scratchpad, the op can read directly
+from LX and process successfully. The resulting row vector is written to LX or HBM; assume the
+ideal case where it resides on LX. Note that core0's scratchpad then only has half of that row,
+as shown in box 1 in the figure below.
+
+If the subsequent `sub` is unfortunately set to process by rows, each core needs the *entire*
+row vector of `buf1` to perform the operation — the half row `max` left on LX is not sufficient
+for each core to proceed. At compile time, `torch-spyre` recognizes the problem and tries to
+remedy it. Without the co-optimizer, work division decisions are considered fixed during
+scratchpad planning, so the only option at this stage is to force `max` to write to HBM instead
+of LX, as shown in box 2a in the figure. Because every core can read from HBM and fetch the
+entire row of `buf1`, `sub` can execute correctly and write its output to HBM (or LX — a
+decision that will be made similarly when planning for the next op).
+
+HBM read/write is more expensive than LX, so a better option is for `sub` to process by columns
+instead, as shown in box 2b in the figure. More generally: work division decisions for each op
+should stay consistent with prior ops' decisions when possible, so the total HBM cost is
+minimized. Hence the need for co-optimization.
+
+:::{figure} ../_static/images/lx/co-optimization-v2.svg
+:alt: A 2-op chain (max then sub) and the LX scratchpad's occupancy at each step; choosing sub's division to match max's keeps every buffer pinned, choosing a mismatched division spills some of them to HBM
+:width: 700px
+:align: center
+:::
 
 ## How it works in general
 
@@ -151,16 +182,6 @@ division for every buffer. CP-SAT and the SA solver never set `prune=True`; this
 specifically to keep *this* DFS's exponential cost affordable, not as a third solving strategy
 alongside them.
 
-:::{figure} ../_static/images/lx/co-optimization.svg
-:alt: Co-optimization searches over alternative split assignments, scoring each by HBM bytes left unpinned
-:width: 700px
-:align: center
-
-The pruned search enumerates split variants per op, scores each combination by counting HBM
-bytes the solver could not pin, and commits the winning assignment back before the standard
-allocator flow.
-:::
-
 Generated alternatives are deduped and filtered down to ones that are actually legal (no
 stick-count overflow, no collapsed/broadcast dims, hard work-division constraints respected).
 Within that, pointwise ops get a handful of dim-flip variants and matmuls get each other's
@@ -199,6 +220,26 @@ the same inputs and the same cost model:
   worse than the seed. See [Joint core-division + LX placement](sa_co_optimization.md) for the
   full mechanics.
 
+### Co-optimizer will honor `spyre_hint` for work divisions
+
+A resolved `spyre_hint(work_div=...)` is still honored under the co-optimizer, not overridden
+by the joint search. `allocator.py` collapses that op's candidate-division list to the single
+division the hint requested *before* either solver runs — the hint acts upstream of the search,
+not as a rule the search itself has to learn or respect. Everything else in the graph stays
+co-optimized as usual; only that one op loses its freedom.
+
+This also means the cost formula itself has no notion of a `spyre_hint` and never
+special-cases one: the formula isn't biased toward the hint, the search just has nothing left
+to search over for that buffer.
+
+This is unconditional on the hint surviving to reach the co-optimizer, including hints inside a
+`for_each_tile` body — except a hint collection/recovery bug during the scan-to-`while_loop`
+retrace currently prevents that propagation (`#5057` fixes it, not yet landed).
+
+Confirmed empirically, not just read in code: a pilot sweep's `bmm_wd` row requesting
+`WD_B=1 WD_K=1 WD_M=8 WD_N=4` produced a compiled kernel whose dumped `MODEL FEATS` carry
+exactly that split, unperturbed.
+
 ### Symbolic cost formula
 
 Both production solvers are driven by a *single* cost expression (`cost_expr`), built once, up
@@ -229,13 +270,14 @@ for candidate in candidates:  # CP-SAT's own solver vars, or SA's (chosen, place
 During the build phase, the inner sum is a buffer's own HBM term, linear in `sym_is_lx` and
 zero once it's pinned. `compute_cost` is zero for every op except a matmul, which adds its
 roofline term keyed off the same `sym_core_divs`. The whole graph's `cost_expr` is just this
-double sum, built once as pure symbols before any decision is made. The search phase never
-changes that expression; it instead scores each candidate by substituting its guess into
-`cost_expr` and evaluating — CP-SAT's own decision variables, or SA's `(chosen, placement)`
-state, are a *different* representation of the same decisions. Once a winner is picked, only
-its guess is ever written back onto the buffers (as `.address` and `.chosen_division`), which
-is what finally pins down what `sym_is_lx` and `sym_core_divs` turned out to mean for that
-buffer.
+double sum, built once as pure symbols before any decision is made.
+
+The search phase never changes that expression; it instead scores each candidate by
+substituting its guess into `cost_expr` and evaluating — CP-SAT's own decision variables, or
+SA's `(chosen, placement)` state, are a *different* representation of the same decisions. Once
+a winner is picked, only its guess is ever written back onto the buffers (as `.address` and
+`.chosen_division`), which is what finally pins down what `sym_is_lx` and `sym_core_divs`
+turned out to mean for that buffer.
 
 When no cost expression is usable (symbolic shapes, serialized captures, or a construction
 error), both solvers fall back to a cheaper **memory-only** objective: pure differential HBM
@@ -243,125 +285,87 @@ traffic, where a resident buffer costs zero and only spills are summed — the c
 term drops out entirely. This fallback is weaker — on a graph where everything already fits,
 every division scores identically and the search has nothing left to optimize on.
 
-## What gets co-optimized
+## What gets co-optimized today
 
-**Controlling it**: the same two flags gate everything below, for both subsections —
-`config.co_optimizing_lx_planning` and `config.layout_solver` — see
-[How it works in general](#how-it-works-in-general) for their options, and for what happens
-with a non-core-division-capable `layout_solver` and the `ExhaustiveSearchSolver` fallback.
+**Controlling it**: `config.co_optimizing_lx_planning` and `config.layout_solver` gate both
+subsections below — see [How it works in general](#how-it-works-in-general) for their options,
+and for what happens with a non-core-division-capable `layout_solver` and the
+`ExhaustiveSearchSolver` fallback. Those two are all (a) needs; (b) adds one more on top,
+`config.auto_coarse_tiling` (env `AUTO_COARSE_TILING`, off by default) — the dedicated switch
+for adding coarse tiling to the pair in (a), inert unless `layout_solver == "cpsat"`.
 
 ### a) LX placement and work division
 
-**What it is**: this pair is the baseline joint search — neither variable alone is a
-"co-optimization" (that needs at least two things decided together), so this is the smallest
-real instance of what the rest of this page describes.
+This pair is the smallest set of "joint" search, covered above in [Why a
+co-optimizer](#why-a-co-optimizer) and [Symbolic cost formula](#symbolic-cost-formula): LX
+placement (where a buffer's resident copy lives, or whether it spills to HBM) and work division
+(how many cores an op uses and which slice each one owns) are both symbols in the same
+`cost_expr`, so the solver can trade one against the other. See [Co-optimizer will honor
+`spyre_hint` for work divisions](#co-optimizer-will-honor-spyre-hint-for-work-divisions) for
+how a forced division interacts with that search.
 
-- **LX placement** is where each buffer's resident copy lives in LX — represented as
-  `address: Optional[int]` on `LifetimeBoundBuffer`; `None` after solving means the buffer
-  spilled to HBM. Eligibility is decided once, declaratively, in
-  `ScratchpadAllocator._residency_reasons`, and carried to every solver as a single
-  `residency_reason` field (`None` = may be pinned, any string = may not) — see
-  [Declarative exclusion](scratchpad_planning.md#declarative-exclusion). The actual placement
-  search (which address, in what order) is `pi` in the SA solver and the 2D no-overlap packing
-  in CP-SAT. Implemented, and the variable the whole scratchpad-planning pass exists to solve —
-  see [Scratchpad Planning](scratchpad_planning.md) for the full allocator architecture, and
-  note that the standalone, placement-only `SimulatedAnnealingLayoutSolver` (see
-  [Simulated Annealing Layout Planner](simulated_annealing_layout.md)) is a *different* class
-  from the joint `SaCoOptimizingSolver` — it only ever moves `pi`, never the division vector
-  `W` below.
-- **Work division** is how many cores an op's output or reduction uses, and which slice of the
-  iteration space each core owns — one split factor per iteration-space symbol. Splitting an
-  **output** dim gives each core a disjoint output slice; splitting a **reduction** dim gives
-  each core a partial result that must be combined. See
-  [Work Division Planning](work_division_planning.md) for the standalone 3-pass planner
-  (span-reduction, cost-model matmul split, default distribution) that picks this when the
-  co-optimizer isn't driving it. As a co-optimized variable, the joint solvers don't re-derive
-  divisions; they search over the *same* candidate space the standalone planner would offer,
-  pre-enumerated per op by `enumerate_work_division_candidates()` (`work_division.py`) and
-  attached to each buffer as a menu of `CoreDivision` candidates
-  (`CoreDivisionBuffer.core_divisions`, `plan_solver.py`). In the SA solver this menu index is
-  exactly the `W` half of the `(pi, W)` state; the **flip** move changes one buffer's chosen
-  index and resizes its per-core footprint, and **recolor** propagates a compatible change
-  across a connected region. In CP-SAT, the menu becomes a decision variable alongside
-  placement in the same constraint model.
-
-**Controlling it**: just the two base flags above — both `"cpsat"` and `"simulated_annealing"`
-reach this pair the same way, with no extra switch needed.
-
-**Status: implemented and tested together** — e.g.
-`test_a_flip_that_shrinks_a_footprint_into_capacity_raises_the_count` exercises exactly the
-scenario the joint search exists for: a buffer that doesn't fit undivided becomes eligible
-once a flip halves its footprint, moving both variables' state at once. The cost expression
-also prices division choice directly — `test_core_division_symbol_drives_the_score` shows the
-predicted score scaling with the number of cores a division uses, confirming it feeds the
-runtime term, not just a memory-fit heuristic.
+**Status**: implemented and tested together — see [Scratchpad
+Planning](scratchpad_planning.md) and [Work Division
+Planning](work_division_planning.md) for each variable's own standalone mechanics.
 
 ### b) LX placement, work division, and coarse tiling
 
-**What it is**: cutting an op's iteration space into sequential tile runs — a `TileSpec` of
-`TileAxis` entries (output and/or reduction axes, each with a count) — so a working set that
-doesn't fit LX at full size can fit one tile at a time. It's a different lever from work
-division: division splits the iteration space *across cores at the same time*; coarse tiling
-splits it *across time, on the same core(s)*. The underlying loop-IR mechanism — how a tiled
-run is represented and survives scheduling and codegen — is implemented and documented in
+A Spyre has 32 cores, and each core's LX scratchpad has only ~1.5MB usable for planning (2MB,
+minus other reservations). Even divided across all 32 cores, a single op's buffer can
+still be too large for its most-divided per-core share to fit — and those large buffers are
+usually the ones that most need LX for efficiency. `torch-spyre` handles this by breaking the
+buffer into tiles and converting the op into a loop, so a working set that doesn't fit LX at
+full size can fit one tile at a time. The analogy to work division is direct: work division
+splits in *space* (across cores, at the same time); coarse tiling splits in *time* (across
+loop iterations, on the same core). The underlying loop-IR mechanism — how a tiled run is
+represented and survives scheduling and codegen — is implemented and documented in
 [Coarse-Tiling Loop IR for the Spyre Backend](coarse_tiling_loops.md); that document also
 points to the design RFC. What's described here is specifically the *solver's* ability to
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
-**Controlling it**: on top of the two base flags above (which still have to select CP-SAT —
-`layout_solver == "cpsat"` — for any of this to apply), `config.auto_coarse_tiling` (env
-`AUTO_COARSE_TILING`, off by default) is the dedicated switch for adding coarse tiling to the
-pair in (a). It's inert with `layout_solver` set to `"simulated_annealing"` or anything else.
+At a high level: tiling isn't priced as a third term alongside LX placement and work division
+in `cost_expr` — it's still decided jointly with them, in the *same* constraint model, just
+ranked by a different objective. CP-SAT takes the lead here. When `auto_coarse_tiling` is on,
+`cost_expr` is dropped and residency, division, and tiling are all still decided together, but
+now ranked by an ordered sequence of tie-breaks instead: residency first, then fewest tiling
+cuts, then parallelism, then division shape, then tile count, each one only resolving ties the
+step before leaves open. Once that solve picks a tiling, the graph is physically rewritten to
+apply it, and residency and division are solved jointly *again* over the now-tiled graph — a
+second joint solve, not a continuation of the first, since tiling is no longer offered as a
+choice at that point. Simulated annealing picks a tiling the same way, jointly with division —
+that part is merged and live in `OpSplitSpace` — but can't act on its own choice yet: applying
+a chosen tiling to the graph is a separate PR still landing, so the ability to choose stays
+gated inert until it does. See the stack status below for exactly where that line is drawn.
 
-**Status: landed for CP-SAT, still in progress for simulated annealing.** The apply-side
-plumbing is landed for both solvers — `scratchpad/coarse_tiling.py` takes a `TileSpec` and
-lowers it to `DimHint`s, and `CoreDivision.tiling` / `min_footprint` in `plan_solver.py`
-already account for a tiling if one is present:
+**Status: landed for CP-SAT, partially landed for simulated annealing.** `CoreDivision.tiling`
+/ `min_footprint` in `plan_solver.py` already account for a tiling if one is present, shared by
+both solvers. The apply-side plumbing itself — `scratchpad/coarse_tiling.py`'s `CoarseTilingPass`
+taking a `TileSpec` and lowering it to `DimHint`s — is CP-SAT's path only; `sa_cooptimizer.py`
+doesn't call it yet, matching the apply step still pending in SA's own stack below:
 
-- **CP-SAT**: landed via `#4768` (`main` as of this update).
+- **CP-SAT**: landed via `#4768` (`main` as of this update). Each op is offered a menu of
+  output-axis tilings, each with its own division menu; a producer/consumer pair is only
+  compatible if they agree on which slice of the shared buffer each tile and core owns.
+  Consecutive ops sharing a loop nest form a loop group, and every producer/consumer edge
+  inside one must be compatible. The solve ranks plans with the lexicographic ladder described
+  above, not `cost_expr`. Once it picks a tiling, `CoarseTilingPass` applies it to the graph
+  and the allocation is solved again over the now-tiled graph, with no further tilings
+  offered — that second plan is the one committed.
 
-  - **Candidates.** An op is offered the output-axis tilings `enumerate_tile_options` finds:
-    never the stick dim, never a reduction axis, never an axis one of its reads repeats along
-    (the repeated dim of `x.repeat`, whose tiles would have to wrap back over `x`), and none
-    that leave a per-core read over the read-distance limit. Ops a `spyre_hint` or
-    `for_each_tile` loop already tiles, every op inside a `for_each_tile` region, restickifies
-    and mutations are offered only the untiled option. Each tiling gets its own division menu,
-    enumerated on the per-tile frame.
-  - **Matching.** A producer/consumer pair of divisions is compatible when the two agree on
-    core ownership and on tile ownership of the buffer they share, both taken on the untiled
-    buffer: tile `t` must touch the same slice on both sides. `TileSpec` equality is not the
-    test — `host_dim` is positional in each op's own output, so equal specs can tile different
-    dims of a shared buffer (a permuted or reducing consumer), and unequal specs the same one.
-    A consumer that reads the buffer more than once has to agree through every read: `a +
-    a.permute(1, 0, 2)` pairs with `a` only under a division or tiling on a dim both reads walk
-    alike. A buffer that may not live in LX gets no compatible pairs; tiling exists to keep
-    buffers in LX, so its producer and consumer never share a nest.
-  - **Loop groups.** Consecutive ops that run the same loop nest (the same trip count at each
-    level) share a loop group. The solve requires every producer/consumer edge inside a group
-    to be a compatible pair. `CoarseTilingPass` checks each such edge again and starts a new
-    group at a consumer that does not read its producer tile by tile, which then reads the
-    producer's full buffer; a plan from this solve never has one.
-  - **Objective.** The cost expression itself is not used, since it has no term for tile size
-    or loop-group boundaries — the solve instead ranks plans lexicographically: LX residency,
-    then *cuts* (tiled ops whose value must be copied out of their nest, for a consumer outside
-    it or as a graph output), then parallelism, division shape, and last, fewest tiles.
-  - **Materialize and re-plan.** When the solve picks any tiling, `CoarseTilingPass` applies it
-    and the allocation is solved again over the tiled graph with no further tilings offered;
-    that second plan is the one committed. A `SolveError` from the first solve falls back to
-    greedy placement over the untouched graph, and one from the second solve over the tiled
-    graph.
+- **Simulated annealing**: a 7-PR stack (`#4456` through `#4894`) adds this; 3 of the 7
+  (`#4456`, `#4457`, `#4491`) are merged, landing `OpSplitSpace`'s `TilingSpace` half and
+  letting the **recolor** move (one of the annealer's search moves — it floods a coordinated
+  division change across a connected region of buffers) propose tiling changes jointly with
+  division — but gated inert by `TILE_CHOICES_ARE_APPLIED = False`, since nothing yet turns a
+  chosen tiling into real tiled ops in the graph. `#4602` is that apply step; `#4611`, `#4770`,
+  and `#4894` round out companion-buffer copy-out pricing, cross-tile-boundary reads, and
+  admission-mismatch fixes found once the apply step exists. `#4894` in particular must land
+  with or before `#4602`'s flag ever goes on — its admission-model fixes close gaps `#4602`'s
+  raise-on-refusal policy turns into compile failures. None of the remaining four are in
+  `main` yet.
 
-- **Simulated annealing**: still landing. A 7-PR stack (`pr-4456` through `pr-4894`) extends
-  `SaCoOptimizingSolver`'s division representation to carry a tiling choice and extends the
-  **recolor** move to propose tiling changes, with companion-buffer copy-out costs (for data
-  that escapes a tile run) priced into the cost model along the way. `main`'s
-  `sa_cooptimizer.py` does not yet carry this.
-
-`scratchpad_planning.md`'s "Current limitations" still lists "No coarse-tiling integration"
-and its "Future work" still lists "Joint operation with the `coarse_tiling` pass" — both now
-stale given CP-SAT's landing (`#4768` added the "Solver-driven coarse tiling" section without
-removing them), worth flagging to whoever maintains that page rather than silently
-contradicting it here.
+`scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point
+here for current status, rather than carrying their own stale claim.
 
 ## Cost model
 
@@ -375,57 +379,36 @@ hardware.
 
 ### How it's integrated: symbolic (CP-SAT) vs. compiled-and-evaluated (SA)
 
-The two production solvers consume the *same* `cost_expr` — one sympy expression built once,
-up front, over every buffer's `sym_is_lx` and `sym_core_divs` symbols — but bind it to a chosen
-candidate in two different ways:
+[Symbolic cost formula](#symbolic-cost-formula) covered the shape of the search: build
+`cost_expr` once, then score each candidate by substituting its guess and evaluating. The two
+solvers differ in what "substitute and evaluate" compiles down to:
 
 - **CP-SAT (symbolic all the way through)**: `_minimize_cost_expr`
   (`scratchpad/ilp_solver_ortools.py`) maps each sympy symbol straight onto a native OR-Tools
-  decision variable —
-
-  ```python
-  sym_map[t.buffer.sym_is_lx.name] = t.in_buffer
-  for key, symbol in t.buffer.sym_core_divs.items():
-      sym_map[symbol.name] = t.cp_core_divs[key]
-  ...
-  cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
-  ```
-
-  — then hands the *whole expression*, still unevaluated, to the constraint model as the
-  objective to minimize. CP-SAT never evaluates `cost_expr` in Python; it searches the
-  symbolic constraint space directly.
-
+  decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
+  `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
+  as the objective to minimize via `_SympyExprToCpSat(...).convert(cost_expr)`. CP-SAT never
+  evaluates `cost_expr` in Python; it searches the symbolic constraint space directly.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
-  (`scratchpad/sa_cooptimizer.py`) instead resolves every symbol to a plain Python callable of
-  `(chosen, resident)` —
+  (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
+  a plain Python function of `(chosen, resident)`, and calls that function fresh for every
+  candidate state the annealer visits — each move gets a real number back, not a symbolic
+  rewrite.
 
-  ```python
-  value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
-      1 if name in resident else 0
-  )
-  ...
-  fn = sympy.lambdify(free, cost_expr, modules="math")
-  ```
+### Inspecting a co-optimization decision
 
-  — compiles `cost_expr` once via `sympy.lambdify` into a fast numeric function, and calls that
-  function fresh for every candidate state the annealer visits. Each move gets a real number
-  back, not a symbolic rewrite.
+Two useful flags:
 
-Same model, same expression, two different consumption strategies: one treats it as a
-constraint to satisfy exactly, the other as a function to sample cheaply, many times, during a
-heuristic search.
-
-### Inspecting a co-optimized solve
-
-[What it prints when turned on](cost_model.md#what-it-prints-when-turned-on) covers
-`SPYRE_DUMP_COST`'s per-bundle breakdown in full, with worked examples; it applies unchanged
-here since the co-optimizer calls the same `explain()`. The one thing specific to a *co-optimized*
-solve is `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line
-per solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
-per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
-chose, every term evaluated under those bindings, and the alternative divisions each buffer
-could have taken instead — a self-describing record of one solve, meant to be read without
-needing to know which flags produced it.
+- `SPYRE_DUMP_COST`: the same per-bundle breakdown [What it prints when
+  turned on](cost_model.md#what-it-prints-when-turned-on) covers in full, with worked
+  examples — it applies unchanged here, since the co-optimizer calls the same `explain()`. A
+  human-readable report, meant for reading at the terminal rather than parsing.
+- `SPYRE_DUMP_COST_EXPR_FILE=<path>`: a companion machine-readable dump, one JSON line per
+  solve (`cost_expr_record` in `scratchpad/plan_solver.py`), recording the objective's
+  per-bundle terms as lossless `sympy.srepr` strings, the symbol bindings the solver actually
+  chose, every term evaluated under those bindings, and the alternative divisions each buffer
+  could have taken instead — a self-describing record of one solve, meant to be read without
+  needing to know which flags produced it. This one is specific to a *co-optimized* solve.
 
 ### Keeping the model honest: recalibrating against real hardware
 
@@ -463,28 +446,19 @@ exactly the kind of category- and config-specific signal this plot is for, that 
 RMS% table alone would not point at directly.
 :::
 
-Read the two PNGs side by side: points moving toward the 1:1 line is an improvement, points
-moving away in one category only is a regression confined to that category (check that
-category's row in the RMS% table to confirm), and a cloud that barely shifts between the two
-images alongside a near-identical RMSE is a no-op change. The scatter is log-log because the
-sweep's `kernel_us` spans about three orders of magnitude (tens of µs for `transpose`/pointwise
-up to several ms for forced-split matmuls); a linear scale would collapse every small kernel
-into the origin and show nothing about them. `--plot` needs matplotlib, which is **not** a
-torch-spyre dependency (base or optional) — install it separately; the flag fails with a clear
-message instead of a traceback when it's missing.
+Read the two PNGs side by side: if a shift is confined to one category, check that category's
+row in the RMS% table to confirm it. The scatter is log-log because the sweep's `kernel_us`
+spans about three orders of magnitude (tens of µs for `transpose`/pointwise up to several ms
+for forced-split matmuls); a linear scale would collapse every small kernel into the origin and
+show nothing about them. `--plot` needs matplotlib, which is **not** a torch-spyre dependency
+(base or optional) — install it separately; the flag fails with a clear message instead of a
+traceback when it's missing.
 
 **Does the sweep need to disable the co-optimizer, so a `WD_*`-forced configuration isn't
-silently overwritten by the joint search?** No. A forced split uses `spyre_hint(work_div=...)`
-(see [How it's integrated](#how-its-integrated-symbolic-cp-sat-vs-compiled-and-evaluated-sa)
-above for what a hint actually does to the solver's input), and `allocator.py`'s division-menu
-builder special-cases a resolved hint before either solver ever runs: it collapses that op's
-candidate list to the single fixed division the hint requested
-(`_legal_fixed_division`, `reason = "user work_div hint"`), so there is nothing left for
-CP-SAT or SA to search over for that op. Confirmed empirically, not just read in code: a pilot
-sweep's `bmm_wd` row requesting `WD_B=1 WD_K=1 WD_M=8 WD_N=4` produced a compiled kernel whose
-dumped `MODEL FEATS` carry exactly `cores=32, matmul_m_split=8, matmul_n_split=4` — the forced
-split, unperturbed. An op with no `WD_*` override is intentionally left for the co-optimizer to
-decide, since those configurations exist to measure the *default* co-optimized behavior.
+silently overwritten by the joint search?** No — see [Co-optimizer will honor `spyre_hint` for
+work divisions](#co-optimizer-will-honor-spyre-hint-for-work-divisions). An op with no `WD_*`
+override is intentionally left for the co-optimizer to decide, since those configurations
+exist to measure the *default* co-optimized behavior.
 
 **Does anything check that the requested config is actually what got measured?** It does now.
 `sweep_records.json` already had `split_forced`/`split_actual` fields meant for exactly this,
@@ -497,18 +471,18 @@ run) when the older debug-only `op_it_space_splits` text isn't present. The pars
 warns on any row where the two disagree, so a hint that silently failed to take shows up as a
 loud warning instead of a quietly wrong measurement.
 
-#### Open items on this measure/score/plot loop
+#### Current sweep plan distribution
 
-- **Audit `sweep_plan.json`'s own coverage.** The plan is generated by deduplicating
-  whatever configurations happen to already have measurements
-  (`run_cost_model_sweep.py`'s `_configs()`, driven by `_env_from_record`) — there is no
-  code anywhere that checks the result for balance, so today's distribution is an artifact
-  of what got measured historically, not a deliberate weighting choice. Measured directly
-  from `sweep_plan.json` (1632 configs total; `run_cost_model_sweep.py --dry-run` reports
-  1518 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
-  released build emits — and `bmm_3d2d_k_tiling`, quarantined after a real hardware incident
-  on 2026-08-07 rather than for being a bad config), grouped into
-  [Accuracy](cost_model.md#accuracy)'s own reporting categories:
+**Audit of `sweep_plan.json`'s own coverage.** The plan is generated by deduplicating
+whatever configurations happen to already have measurements
+(`run_cost_model_sweep.py`'s `_configs()`, driven by `_env_from_record`) — there is no
+code anywhere that checks the result for balance, so today's distribution is an artifact
+of what got measured historically, not a deliberate weighting choice. Measured directly
+from `sweep_plan.json` (1632 configs total; `run_cost_model_sweep.py --dry-run` reports
+1518 of those because `_SKIP_OPS` excludes `bmm_layout` — a non-default operand layout no
+released build emits — and `bmm_3d2d_k_tiling`, quarantined after a real hardware incident
+on 2026-08-07 rather than for being a bad config), grouped into
+[Accuracy](cost_model.md#accuracy)'s own reporting categories:
 
   <table>
   <thead><tr><th>group</th><th>category</th><th>configs</th><th>% of 1632</th></tr></thead>
@@ -547,95 +521,102 @@ loud warning instead of a quietly wrong measurement.
   per core count — and check the plan against that, rather than assuming today's
   distribution reflects anyone's intent. See [Ongoing work](#ongoing-work) for a concrete
   plan to act on this rather than just flagging it.
-- **New co-optimized axes need their own sweep configs, deliberately added.** CP-SAT's
+
+## Ongoing work
+
+Open items from drafting this page that are worth resolving before calling it done:
+
+### Cost model-related:
+
+- A concrete plan for rebalancing `sweep_plan.json`, picking up the coverage audit above:
+  1. Set a minimum-sample floor per category before trusting its RMS% number for a real
+     decision — e.g. 20 configs as a starting bar (matching the under-20 threshold already
+     flagged above). `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, and `bmm_nested` fall
+     below it today.
+  2. Add targeted configs for each under-floor category, varying the dimension most likely to
+     matter for that op (core count for `matmul`/`bmm` families; tile count for the
+     `_k_tiling`/`_nested` variants) rather than just repeating the same shape — a config that
+     doesn't vary anything new doesn't reduce the real uncertainty, only the per-run
+     measurement noise.
+  3. Measure the new configs: `python3 docs/source/user_guide/examples/profile_ops.py` for a
+     one-off, or add them to a local copy of `sweep_plan.json` and run
+     `run_cost_model_sweep.py --configs <path>` for a batch; `BENCH_EMIT_RECORDS=1` and
+     `SPYRE_DUMP_COST=1` must both be set (the sweep driver already sets them) so the new
+     rows carry `feats`, not just `io`.
+  4. Fold the result back into the shipped plan: once new measurements exist in a local
+     `sweep_records.json`, `run_cost_model_sweep.py --from-records --export-configs
+     tools/cost_model/sweep_plan.json` regenerates the committed plan from every
+     configuration that database now contains, including the new ones — this is also how any
+     future solver-driven-coarse-tiling knob (the gap flagged below) would get its own sweep
+     coverage once one exists.
+  5. Re-check with `eval_model.py`: confirm the previously-thin categories' RMS% is now
+     computed over a real sample, and `--plot` the new scatter against the old one the way
+     [Keeping the model honest](#keeping-the-model-honest-recalibrating-against-real-hardware)
+     already describes for a `cost_model.py` edit — the same before/after comparison applies
+     to a sweep-plan change, since both move the measured population the model is scored
+     against.
+- New co-optimized axes need their own sweep configs, deliberately added. CP-SAT's
   solver-chosen coarse tiling (`#4768`, `config.auto_coarse_tiling`, described above) landed
   without one: checked directly against the landed commit, it touches neither `profile_ops.py`,
   `tools/cost_model/sweep_plan.json`, nor `eval_model.py` — the new tiling-candidate machinery
   has no sweep knob of its own yet, the same way `WD_M`/`WD_N`/`WD_K` is `mmwd`'s knob for
   forced work-division splits today. Its prediction accuracy is therefore unmeasured right now,
   not hypothetically — nothing in [Accuracy](cost_model.md#accuracy)'s table covers it. The
-  same gap is coming for simulated annealing's stack (`pr-4456` through `pr-4894`) once it
-  lands too. Combined with the point above (no automatic coverage check), a new optimization
-  axis landing without a deliberate sweep-plan update is a real way for its prediction accuracy
-  to go unmeasured indefinitely rather than loudly missing.
-- **Could the model tune itself?** Today, fitting is manual: someone reads
-  `eval_model.py`'s RMS% table and `--plot` scatter, forms a hypothesis, edits a constant
-  or term in `cost_model.py`, and re-scores. Every constant in `CostParams` already carries
-  its own fitting provenance in the module docstring (e.g. `alpha ~0.00574 ns/byte,
-  calibrated so a balanced 1R+1W read lands at its measured ~105 GB/s effective`) — that
-  record-keeping discipline is worth preserving in whatever replaces manual tuning. One
-  direction: evolve the closed-form model into a small learned one (e.g. an MLP over the
-  same `OpFeatures` fields) fit by SGD/backprop against `sweep_records.json`'s measured
-  `kernel_us` directly, instead of hand-deriving each term. Worth weighing against the one
-  related attempt already in the file's history: an empirical correction term for the
-  `max(compute, memory)` under-charge was fitted and then **removed rather than shipped**
-  because its fitted value proved unstable across populations (`cost_model.md`'s
-  [Two limitations worth knowing](cost_model.md#two-limitations-worth-knowing)) — a learned
-  model trades interpretable, individually-justified constants for exactly this kind of
-  population-dependent fit, so the same instability risk would need to be addressed (e.g.
-  held-out validation across categories, not just an aggregate RMS%) before trusting it
-  over the current closed form.
-- **Nothing memoizes a co-optimizer solve across compiles.** Every `torch.compile` that
-  reaches `CoOptimizingAllocator` runs a full CP-SAT solve or SA anneal from scratch, even
-  for a graph shape the search has already solved before. The caching that does exist
-  (`torch_spyre/execution/kernel_cache.py`) is a different thing: its hash
-  (`compute_specs_hash`) covers the *already-resolved* `OpSpec`/`LoopSpec` tree — the
-  solver's output, not an input that could look a prior solve up — so it only skips
-  recompiling an identical finished plan, never the search that produced it. A real
-  "memorize the optimum" layer would need a cache keyed on something available *before* the
-  solve (the graph's iteration-space shape and candidate menus, not the committed division),
-  checked against a cache before `plan_layout_and_core_divisions` runs, with a defined
-  policy for a near-but-not-exact shape match (reuse as a warm start vs. require an exact
-  key). No such layer, warm-start or otherwise, exists today in `allocator.py`,
-  `ilp_solver_ortools.py`, or `sa_cooptimizer.py`.
+  same gap is coming for simulated annealing's stack (`#4456` through `#4894`, 3 of 7 merged —
+  see [b) LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling))
+  once the remaining PRs land and the feature is actually reachable. Combined with the point
+  above (no automatic coverage check), a new optimization axis landing without a deliberate
+  sweep-plan update is a real way for its prediction accuracy to go unmeasured indefinitely
+  rather than loudly missing.
+- Could the model tune itself? Today, fitting is manual: someone reads `eval_model.py`'s RMS%
+  table and `--plot` scatter, forms a hypothesis, edits a constant or term in `cost_model.py`,
+  and re-scores. Every constant in `CostParams` already carries its own fitting provenance in
+  the module docstring (e.g. `alpha ~0.00574 ns/byte, calibrated so a balanced 1R+1W read
+  lands at its measured ~105 GB/s effective`) — that record-keeping discipline is worth
+  preserving in whatever replaces manual tuning. One direction: evolve the closed-form model
+  into a small learned one (e.g. an MLP over the same `OpFeatures` fields) fit by SGD/backprop
+  against `sweep_records.json`'s measured `kernel_us` directly, instead of hand-deriving each
+  term. Worth weighing against the one related attempt already in the file's history: an
+  empirical correction term for the `max(compute, memory)` under-charge was fitted and then
+  removed rather than shipped because its fitted value proved unstable across populations
+  (`cost_model.md`'s [Two limitations worth knowing](cost_model.md#two-limitations-worth-knowing)) —
+  a learned model trades interpretable, individually-justified constants for exactly this kind
+  of population-dependent fit, so the same instability risk would need to be addressed (e.g.
+  held-out validation across categories, not just an aggregate RMS%) before trusting it over
+  the current closed form.
 
-## Ongoing work
+### Tiling-related:
 
-Open items from drafting this page that are worth resolving before calling it done:
-
-- CP-SAT's coarse-tiling stack landed first (`#4768`), updating [b) LX placement, work
-  division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling) above
-  accordingly. SA's stack (`pr-4456` through `pr-4894`) is
-  still pending — update that section again once it lands rather than leaving CP-SAT's
-  landed/SA's pending split stale the way `scratchpad_planning.md`'s own "Current
-  limitations"/"Future work" lists were left after `#4768` (flagged above).
+- SA's coarse-tiling stack (`#4456` through `#4894`) is 3 of 7 merged as of this update —
+  update [b) LX placement, work division, and coarse
+  tiling](#b-lx-placement-work-division-and-coarse-tiling) above (and `scratchpad_planning.md`'s
+  pointers to it) again as `#4602`, `#4611`, `#4770`, and `#4894` land.
 - The existing docs *and the current code* use "tiling" for at least two different things —
   `CoreDivision.tiling` (coarse tiling proper, a `TileSpec`), and, separately, (a)
   `scratchpad_planning.md`'s co-optimization section calling core-division splits for matmuls
   "the matmuls' tilings," and (b) `sa_cooptimizer.py`'s own `_flood_region(anchor, tiling)` and
-  `_rng.choice(self._nontrivial_menu[anchor])`, where `tiling` names a **division-menu index**,
-  not a `TileSpec` — confirmed on `upstream/main` as of this draft (`sa_cooptimizer.py:519-581`).
+  `_rng.choice(self._nontrivial_menu[anchor])`, where `tiling` names a division-menu index, not
+  a `TileSpec` — confirmed on `upstream/main` as of this draft (`sa_cooptimizer.py:519-581`).
   So the naming collision isn't just a doc-wording slip; it's in a parameter name in the
   pre-coarse-tiling code the SA stack is extending. Worth a terminology pass across the
   documents *and* that code once coarse tiling lands, so "division"/"split" and "tiling" stay
   consistently distinct.
-- **A concrete plan for rebalancing `sweep_plan.json`**, picking up the coverage audit above:
-  1. **Set a minimum-sample floor per category** before trusting its RMS% number for a real
-     decision — e.g. 20 configs as a starting bar (matching the under-20 threshold already
-     flagged above). `matmul`, `matmul_k`, `matmul_nested`, `bmm_3d2d`, and `bmm_nested` fall
-     below it today.
-  2. **Add targeted configs for each under-floor category**, varying the dimension most
-     likely to matter for that op (core count for `matmul`/`bmm` families; tile count for
-     the `_k_tiling`/`_nested` variants) rather than just repeating the same shape — a
-     config that doesn't vary anything new doesn't reduce the real uncertainty, only the
-     per-run measurement noise.
-  3. **Measure the new configs**: `python3 docs/source/user_guide/examples/profile_ops.py`
-     for a one-off, or add them to a local copy of `sweep_plan.json` and run
-     `run_cost_model_sweep.py --configs <path>` for a batch; `BENCH_EMIT_RECORDS=1` and
-     `SPYRE_DUMP_COST=1` must both be set (the sweep driver already sets them) so the new
-     rows carry `feats`, not just `io`.
-  4. **Fold the result back into the shipped plan**: once new measurements exist in a local
-     `sweep_records.json`, `run_cost_model_sweep.py --from-records --export-configs
-     tools/cost_model/sweep_plan.json` regenerates the committed plan from every
-     configuration that database now contains, including the new ones — this is also how
-     any future solver-driven-coarse-tiling knob (the gap flagged above) would get its own
-     sweep coverage once one exists.
-  5. **Re-check with `eval_model.py`**: confirm the previously-thin categories' RMS% is now
-     computed over a real sample, and `--plot` the new scatter against the old one the way
-     [Keeping the model honest](#keeping-the-model-honest-recalibrating-against-real-hardware)
-     already describes for a `cost_model.py` edit — the same before/after comparison applies
-     to a sweep-plan change, since both move the measured population the model is scored
-     against.
+
+### Solver performance:
+
+- Nothing memoizes a co-optimizer solve across compiles. Every `torch.compile` that reaches
+  `CoOptimizingAllocator` runs a full CP-SAT solve or SA anneal from scratch, even for a graph
+  shape the search has already solved before. The caching that does exist
+  (`torch_spyre/execution/kernel_cache.py`) is a different thing: its hash
+  (`compute_specs_hash`) covers the *already-resolved* `OpSpec`/`LoopSpec` tree — the solver's
+  output, not an input that could look a prior solve up — so it only skips recompiling an
+  identical finished plan, never the search that produced it. A real "memorize the optimum"
+  layer would need a cache keyed on something available *before* the solve (the graph's
+  iteration-space shape and candidate menus, not the committed division), checked against a
+  cache before `plan_layout_and_core_divisions` runs, with a defined policy for a
+  near-but-not-exact shape match (reuse as a warm start vs. require an exact key). No such
+  layer, warm-start or otherwise, exists today in `allocator.py`, `ilp_solver_ortools.py`, or
+  `sa_cooptimizer.py`.
 
 ## Related documents
 
