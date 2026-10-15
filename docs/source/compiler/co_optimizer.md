@@ -21,7 +21,7 @@ into [Scratchpad Planning](scratchpad_planning.md), [Work Division Planning](wor
 
 - [Why a co-optimizer](#why-a-co-optimizer)
 - [How it works in general](#how-it-works-in-general)
-- [What gets co-optimized today](#what-gets-co-optimized)
+- [What gets co-optimized today](#what-gets-co-optimized-today)
   - [LX placement and work division](#a-lx-placement-and-work-division)
   - [LX placement, work division, and coarse tiling](#b-lx-placement-work-division-and-coarse-tiling)
 - [Cost model](#cost-model)
@@ -301,7 +301,7 @@ co-optimizer](#why-a-co-optimizer) and [Symbolic cost formula](#symbolic-cost-fo
 placement (where a buffer's resident copy lives, or whether it spills to HBM) and work division
 (how many cores an op uses and which slice each one owns) are both symbols in the same
 `cost_expr`, so the solver can trade one against the other. See [Co-optimizer will honor
-`spyre_hint` for work divisions](#co-optimizer-will-honor-spyre-hint-for-work-divisions) for
+`spyre_hint` for work divisions](#co-optimizer-will-honor-spyre_hint-for-work-divisions) for
 how a forced division interacts with that search.
 
 **Status**: implemented and tested together — see [Scratchpad
@@ -456,7 +456,7 @@ traceback when it's missing.
 
 **Does the sweep need to disable the co-optimizer, so a `WD_*`-forced configuration isn't
 silently overwritten by the joint search?** No — see [Co-optimizer will honor `spyre_hint` for
-work divisions](#co-optimizer-will-honor-spyre-hint-for-work-divisions). An op with no `WD_*`
+work divisions](#co-optimizer-will-honor-spyre_hint-for-work-divisions). An op with no `WD_*`
 override is intentionally left for the co-optimizer to decide, since those configurations
 exist to measure the *default* co-optimized behavior.
 
