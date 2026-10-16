@@ -1023,9 +1023,9 @@ def _rewire_accumulator_output(
     Why the initial buffer and not a fresh one: the accumulator's fill is
     already there. ``for_each_tile(..., init=torch.zeros(M, N))`` lowers to a
     real zeros-filling ``ComputedBuffer`` that runs before the loop, which is
-    exactly the "fill" step WSR's ``CarriedReductionRecord`` pattern wants;
-    reusing it avoids synthesizing a second fill (and a second buffer) that
-    would then have to be kept consistent with it.
+    exactly the "fill" step an accumulator needs; reusing it avoids
+    synthesizing a second fill (and a second buffer) that would then have to be
+    kept consistent with it.
 
     The outside consumer is reached through the ``WhileLoop``'s
     ``MultiOutput`` child for this carry index -- the object
