@@ -129,7 +129,7 @@ class _PaddedLoadHandler(WrapperHandler):
     into host coordinates against y's layout and re-composed with the padded
     buffer's indexer.
 
-    This wraps the live index (see CLAUDE.md "Compiler Pass Conventions")
+    This wraps the live index (see AGENTS.md "Compiler Pass Conventions")
     rather than re-deriving y's coordinates from the matmul's dim order, so
     any view stays correct by construction.
     """

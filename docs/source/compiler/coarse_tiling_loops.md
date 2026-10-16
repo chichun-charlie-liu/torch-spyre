@@ -2075,7 +2075,7 @@ in the splice/stamp step itself than in anything covered here.
 
 ### The wrap-never-reconstruct convention in practice
 
-CLAUDE.md states the rule plainly: *"Modifying `ComputedBuffer.inner_fn`:
+AGENTS.md states the rule plainly: *"Modifying `ComputedBuffer.inner_fn`:
 wrap, never reconstruct. Use a `WrapperHandler` subclass ... installed with
 `V.set_ops_handler(handler)` inside the original `inner_fn`."* The reason is
 that `inner_fn` closes over symbolic index expressions computed against a
@@ -2134,7 +2134,7 @@ Call sites, all following this exact shape:
   mechanism from name-swapping, detailed in the next subsection.
 - `insert_restickify_on_node_inputs` (in `insert_restickify.py`, using
   the canonical `NameSwapHandler` defined in the same file),
-  the example CLAUDE.md itself points to.
+  the example AGENTS.md itself points to.
 
 One site looks like an exception but is not: `_insert_copy_op`
 (in `coarse_tile.py`) builds a **new** `Pointwise` via
