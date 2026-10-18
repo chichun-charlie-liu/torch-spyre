@@ -1632,6 +1632,39 @@ class TestForEachTileGraphShapesE2E(_DynamoResetTestCase):
         self.assertEqual(int(weight_step.group(1)) * 64, hidden * ffn)
         self.assertNotIn("read_copy", src)
 
+    def test_split_k_over_head_groups(self):
+        """Split the o_proj contraction over groups of heads.
+
+        ``x`` is the decode attention output ``[B, H, 1, D]``; each trip reads
+        ``Ht`` heads, so the contraction variable covers one tile (``Ht * D`` of
+        ``H * D``) of a head dim that is factorized on the host
+        (``[0, floor(d1/D), 0, Mod(d1, D)]``).  The tile position enters through
+        the loop index, not the host coordinates.  The weight tile is likewise a
+        ``[N, Ht, D]`` view reshaped to ``[N, Ht * D]``.
+        """
+        import torch.nn.functional as F
+
+        from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+        B, H, D, Ht = 1, 32, 128, 8
+        hidden = H * D
+        a = shaped_randn(B, H, 1, D)
+        w = shaped_randn(hidden, hidden, seed=1) * 0.05
+
+        def fn(a, w):
+            w3 = w.view(hidden, H, D)
+
+            def body(acc, ops):
+                a_t, w_t = ops
+                x = a_t.transpose(1, 2).reshape(B, 1, Ht * D)
+                return acc + F.linear(x, w_t.reshape(hidden, Ht * D)), None
+
+            init = torch.zeros(B, 1, hidden, dtype=a.dtype, device=a.device)
+            return for_each_tile(body, (a, w3), dims=(1, 1), tile_size=Ht, init=init)[0]
+
+        ref = F.linear(a.transpose(1, 2).reshape(B, 1, hidden).float(), w.float())
+        self._check(fn, (a, w), ref, trips=H // Ht)
+
     def test_carried_sum_over_tiled_dim(self):
         v = shaped_randn(4, 64, 64)
         fn = lambda v: carried_reduction_fn(v, lambda acc, s: acc + s.sum(0), 0.0)  # noqa: E731

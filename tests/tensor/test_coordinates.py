@@ -897,20 +897,39 @@ class TestFactorizedMatmulCandidates(TestCase):
             )
 
     def test_rejects_noncontiguous_or_partial_factorized_chain(self):
-        """Only a full, gap-free mixed-radix view is safe to collapse."""
+        """Only a gap-free mixed-radix view, windowed on whole inner dims, collapses."""
         scenarios = (
+            # Heads stride 256 over a 128-wide D leaves a gap between heads.
             self._same_graph_attention_scenario(host_stride=(262144, 4096, 256, 1)),
-            self._same_graph_attention_scenario(contraction_range=2048),
+            # 2000 elements end in the middle of a head (not a multiple of D).
+            self._same_graph_attention_scenario(contraction_range=2000),
         )
         for arg, contraction, source in scenarios:
             with self.subTest(
                 stride=arg.layout.stride,
                 contraction_range=arg.dep.ranges[contraction],
             ):
-                with self.assertRaisesRegex(Unsupported, "full-range contiguous"):
+                with self.assertRaisesRegex(Unsupported, "contiguous host dimension"):
                     find_stick_compatible_input_layout(
                         arg, contraction, BATCH_MATMUL_OP, "x"
                     )
+
+    def test_windowed_factorized_chain_collapses_to_the_full_chain(self):
+        """A contraction var covering whole heads of a gap-free view collapses.
+
+        A ``for_each_tile`` over head groups reads one window of the chain
+        (here 16 of 32 heads, 2048 of 4096 elements); the window's position
+        enters through the loop index, not the host coordinates.  The canonical
+        layout must span the whole chain, not just the window.
+        """
+        arg, contraction, _ = self._same_graph_attention_scenario(
+            contraction_range=2048
+        )
+        result = find_stick_compatible_input_layout(
+            arg, contraction, BATCH_MATMUL_OP, "x"
+        )
+        self.assertEqual(list(result.device_size), [64, 64, 1, 64])
+        self.assertEqual(list(result.stride_map), [4096, 64, -1, 1])
 
     def test_nonstandard_matmul_layout_is_not_canonicalized(self):
         """Non-STANDARD formats are returned unchanged by Pass 3."""
